@@ -365,7 +365,31 @@ def create_styled_keyboard(keyboard_array) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=keyboard_array)
 
 
-def get_country_flag(country: str) -> str:
+SESSION_STRING_PREVIEW_LEN = 60
+
+
+def format_session_preview(session_string: Optional[str]) -> str:
+    """Return a formatted block for displaying a session string in messages."""
+    if not session_string:
+        return "🔐 <b>Session String:</b> Not configured"
+    preview = session_string[:SESSION_STRING_PREVIEW_LEN]
+    if len(session_string) > SESSION_STRING_PREVIEW_LEN:
+        preview += "…"
+    return (
+        f"🔐 <b>Session String (preview):</b>\n"
+        f"<code>{preview}</code>\n"
+        f"<i>(Full string available in My Purchases → this number)</i>"
+    )
+
+
+def format_session_full(session_string: Optional[str]) -> str:
+    """Return a formatted block showing the complete session string."""
+    if not session_string:
+        return "🔐 <b>Session String:</b> Not configured"
+    return f"🔐 <b>Session String:</b>\n<code>{session_string}</code>"
+
+
+
     return COUNTRY_FLAGS.get(country.lower().strip(), "🌍")
 
 
@@ -1617,7 +1641,7 @@ async def _show_category_countries(
     buttons = [
         [apply_button_style(InlineKeyboardButton(
             text=f"{get_country_flag(country)} {country.title()} ({count})",
-            callback_data=f"cat_country_{category}_{country}",
+            callback_data=f"cat_country_{category}|{country}",
         ), 'primary')]
         for country, count in page_data
     ]
@@ -1655,15 +1679,15 @@ async def _show_category_countries(
 @router.callback_query(F.data.startswith("cat_country_"))
 async def cb_cat_country(query: CallbackQuery) -> None:
     """Show country availability info and buy button."""
-    # Format: cat_country_{category}_{country}
-    parts = query.data.replace("cat_country_", "").split("_", 1)
+    # Format: cat_country_{category}|{country}
+    parts = query.data.replace("cat_country_", "").split("|", 1)
     if len(parts) != 2:
         await query.answer("Invalid request", show_alert=True)
         return
-    
+
     category, country = parts
     category_name = PRODUCT_CATEGORIES.get(category, "Unknown")
-    
+
     async with AsyncSessionFactory() as session:
         # Get available count and price for this country/category
         rows = await session.execute(
@@ -1676,15 +1700,24 @@ async def cb_cat_country(query: CallbackQuery) -> None:
             .order_by(Product.price)
         )
         products = rows.scalars().all()
-    
+
     if not products:
-        await query.answer("❌ No numbers available for this country.", show_alert=True)
+        await query.answer()
+        await query.message.edit_text(
+            f"😔 <b>No numbers available</b> for "
+            f"{get_country_flag(country)} {country.title()} right now.\n\n"
+            f"Please check back later or choose another country.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data=f"buy_cat_{category}"), 'danger'),
+            ]]),
+            parse_mode=ParseMode.HTML,
+        )
         return
-    
+
     await query.answer()
     available_count = len(products)
     price = products[0].price  # All should have same price per country
-    
+
     await query.message.edit_text(
         f"🌍 <b>{get_country_flag(country)} {country.title()}</b>\n"
         f"📁 <b>Category:</b> {category_name}\n\n"
@@ -1694,37 +1727,132 @@ async def cb_cat_country(query: CallbackQuery) -> None:
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Click <b>Buy Now</b> to purchase a random number from this pool.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [apply_button_style(InlineKeyboardButton(text="✅ Buy Now", callback_data=f"buy_now_{category}_{country}"), 'success')],
+            [apply_button_style(InlineKeyboardButton(text="🛒 Buy Now", callback_data=f"buy_confirm_{category}|{country}"), 'primary')],
             [apply_button_style(InlineKeyboardButton(text="🔴 Cancel", callback_data=f"buy_cat_{category}"), 'danger')],
         ]),
         parse_mode=ParseMode.HTML,
     )
 
 
-@router.callback_query(F.data.startswith("buy_now_"))
-async def cb_buy_now(query: CallbackQuery) -> None:
-    """Process purchase - randomly assign a number from the pool."""
+@router.callback_query(F.data.startswith("buy_confirm_"))
+async def cb_buy_confirm(query: CallbackQuery) -> None:
+    """Show purchase confirmation dialog before buying."""
     await query.answer()
-    # Format: buy_now_{category}_{country}
-    parts = query.data.replace("buy_now_", "").split("_", 1)
+    # Format: buy_confirm_{category}|{country}
+    parts = query.data.replace("buy_confirm_", "").split("|", 1)
     if len(parts) != 2:
         await query.answer("Invalid request", show_alert=True)
         return
-    
+
     category, country = parts
     user_id = query.from_user.id
-    
+
+    async with AsyncSessionFactory() as session:
+        user = await get_or_create_user(
+            session, user_id, query.from_user.username,
+            first_name=query.from_user.first_name,
+        )
+
+        if user.is_banned:
+            await query.answer("🚫 You are banned from using this bot.", show_alert=True)
+            return
+
+        rows = await session.execute(
+            select(Product)
+            .where(
+                Product.country == country,
+                Product.category == category,
+                Product.status == "Available"
+            )
+            .order_by(Product.price)
+        )
+        products = rows.scalars().all()
+
+    if not products:
+        await query.message.edit_text(
+            "❌ <b>No Numbers Available</b>\n\nThis country's stock is now empty. "
+            "Please choose another country.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data=f"buy_cat_{category}"), 'danger'),
+            ]]),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    price = Decimal(str(products[0].price))
+    available_count = len(products)
+    user_balance = Decimal(str(user.balance or 0))
+    can_afford = user_balance >= price
+    flag = get_country_flag(country)
+    balance_after = user_balance - price if can_afford else user_balance
+
+    if can_afford:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [apply_button_style(InlineKeyboardButton(
+                text="✅ Confirm Purchase",
+                callback_data=f"buy_execute_{category}|{country}",
+            ), 'primary')],
+            [apply_button_style(InlineKeyboardButton(
+                text="🔴 Cancel",
+                callback_data=f"cat_country_{category}|{country}",
+            ), 'danger')],
+        ])
+        balance_line = (
+            f"💰 <b>Your Balance:</b> ${user_balance:.2f} USDT\n"
+            f"💵 <b>Cost:</b> ${price:.2f} USDT\n"
+            f"📉 <b>Balance after purchase:</b> ${balance_after:.2f} USDT"
+        )
+    else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [apply_button_style(InlineKeyboardButton(text="📥 Deposit Funds", callback_data="deposit"), 'primary')],
+            [apply_button_style(InlineKeyboardButton(
+                text="🔴 Cancel",
+                callback_data=f"cat_country_{category}|{country}",
+            ), 'danger')],
+        ])
+        balance_line = (
+            f"💰 <b>Your Balance:</b> ${user_balance:.2f} USDT\n"
+            f"💵 <b>Required:</b> ${price:.2f} USDT\n\n"
+            f"❌ <b>Insufficient balance.</b> Please deposit funds first."
+        )
+
+    await query.message.edit_text(
+        f"🛒 <b>Confirm Purchase</b>\n\n"
+        f"🌍 <b>Country:</b> {flag} {country.title()}\n"
+        f"📱 <b>Available:</b> {available_count} number(s)\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{balance_line}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{'Tap <b>Confirm Purchase</b> to proceed.' if can_afford else 'Deposit to unlock purchase.'}",
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.callback_query(F.data.startswith("buy_execute_"))
+async def cb_buy_execute(query: CallbackQuery) -> None:
+    """Process purchase - randomly assign a number from the pool."""
+    await query.answer()
+    # Format: buy_execute_{category}|{country}
+    parts = query.data.replace("buy_execute_", "").split("|", 1)
+    if len(parts) != 2:
+        await query.answer("Invalid request", show_alert=True)
+        return
+
+    category, country = parts
+    user_id = query.from_user.id
+
     async with AsyncSessionFactory() as session:
         # Get user
         user = await get_or_create_user(
             session, user_id, query.from_user.username,
             first_name=query.from_user.first_name,
         )
-        
+
         if user.is_banned:
             await query.answer("🚫 You are banned from using this bot.", show_alert=True)
             return
-        
+
         # Get available products for this category/country
         rows = await session.execute(
             select(Product)
@@ -1735,14 +1863,21 @@ async def cb_buy_now(query: CallbackQuery) -> None:
             )
         )
         available_products = rows.scalars().all()
-        
+
         if not available_products:
-            await query.answer("❌ No numbers available. Please try another country.", show_alert=True)
+            await query.message.edit_text(
+                "❌ <b>No numbers available.</b>\n\nThis stock just ran out. "
+                "Please try another country.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data=f"buy_cat_{category}"), 'danger'),
+                ]]),
+                parse_mode=ParseMode.HTML,
+            )
             return
-        
+
         # Securely randomly select one product
         product = secrets.choice(available_products)
-        
+
         # Check balance
         if Decimal(str(user.balance)) < Decimal(str(product.price)):
             await query.message.edit_text(
@@ -1751,13 +1886,13 @@ async def cb_buy_now(query: CallbackQuery) -> None:
                 f"💵 Required: <b>${product.price:.2f}</b>\n\n"
                 f"Please deposit funds first.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [apply_button_style(InlineKeyboardButton(text="📥 Deposit", callback_data="deposit"), 'success')],
-                    [apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data=f"cat_country_{category}_{country}"), 'danger')],
+                    [apply_button_style(InlineKeyboardButton(text="📥 Deposit", callback_data="deposit"), 'primary')],
+                    [apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data=f"cat_country_{category}|{country}"), 'danger')],
                 ]),
                 parse_mode=ParseMode.HTML,
             )
             return
-        
+
         # Process purchase
         new_balance = Decimal(str(user.balance)) - Decimal(str(product.price))
         await session.execute(
@@ -1773,11 +1908,11 @@ async def cb_buy_now(query: CallbackQuery) -> None:
             .where(Product.id == product.id)
             .values(status="Sold")
         )
-        
+
         order = Order(user_id=user_id, product_id=product.id, status="Completed")
         session.add(order)
         await session.flush()
-        
+
         txn = Transaction(
             user_id=user_id,
             order_id=order.id,
@@ -1787,7 +1922,7 @@ async def cb_buy_now(query: CallbackQuery) -> None:
         )
         session.add(txn)
         await session.commit()
-        
+
         phone = product.phone_number
         price = product.price
         sess_str = product.session_string
@@ -1806,11 +1941,15 @@ async def cb_buy_now(query: CallbackQuery) -> None:
     if sess_str:
         await otp_manager.start_listener(pid, sess_str)
 
+    # Build session preview for success message
+    session_info = format_session_preview(sess_str)
+
     await query.message.edit_text(
         f"🎉 <b>Purchase Successful!</b>\n\n"
         f"📱 <b>Number:</b> <code>{phone}</code>\n"
         f"🌍 <b>Country:</b> {get_country_flag(country)} {country.title()}\n"
-        f"💵 <b>Paid:</b> ${price:.2f} USDT\n\n"
+        f"💵 <b>Paid:</b> ${price:.2f} USDT\n"
+        f"{session_info}\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"📋 <b>Next Steps:</b>\n"
         f"1️⃣ Open <b>Telegram / Telegram X / TurboTel</b>\n"
@@ -1934,9 +2073,9 @@ async def cb_product(query: CallbackQuery) -> None:
     await query.message.edit_text(
         f"📱 <b>{p.phone_number}</b> ({p.country})\n"
         f"💵 Price: <b>${p.price:.2f} USDT</b>\n\n"
-        f"Tap <b>Buy Now</b> to purchase.",
+        f"Tap <b>Buy Now</b> to proceed to confirmation.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [apply_button_style(InlineKeyboardButton(text="✅ Buy Now", callback_data=f"buynow_{product_id}"), 'success')],
+            [apply_button_style(InlineKeyboardButton(text="🛒 Buy Now", callback_data=f"buynow_{product_id}"), 'primary')],
             [apply_button_style(InlineKeyboardButton(text="◀️ Back",    callback_data=f"country_{p.country}"), 'danger')],
         ]),
         parse_mode=ParseMode.HTML,
@@ -1945,6 +2084,7 @@ async def cb_product(query: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("buynow_"))
 async def cb_buynow(query: CallbackQuery) -> None:
+    """Show confirmation dialog before legacy single-number purchase."""
     await query.answer()
     product_id = int(query.data.split("_")[1])
     user_id = query.from_user.id
@@ -1953,10 +2093,92 @@ async def cb_buynow(query: CallbackQuery) -> None:
         result_p = await session.execute(select(Product).where(Product.id == product_id))
         p = result_p.scalar_one_or_none()
         if p is None or p.status != "Available":
-            await query.answer("This number is no longer available.", show_alert=True)
+            await query.message.edit_text(
+                "❌ This number is no longer available.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="buy"), 'danger'),
+                ]]),
+                parse_mode=ParseMode.HTML,
+            )
             return
 
-        user = await get_or_create_user(session, user_id, query.from_user.username)
+        user = await get_or_create_user(session, user_id, query.from_user.username,
+                                        first_name=query.from_user.first_name)
+
+    if user.is_banned:
+        await query.answer("🚫 You are banned from using this bot.", show_alert=True)
+        return
+
+    price = Decimal(str(p.price))
+    user_balance = Decimal(str(user.balance or 0))
+    can_afford = user_balance >= price
+    balance_after = user_balance - price if can_afford else user_balance
+
+    if can_afford:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [apply_button_style(InlineKeyboardButton(
+                text="✅ Confirm Purchase",
+                callback_data=f"buynowexec_{product_id}",
+            ), 'primary')],
+            [apply_button_style(InlineKeyboardButton(
+                text="🔴 Cancel",
+                callback_data=f"product_{product_id}",
+            ), 'danger')],
+        ])
+        balance_line = (
+            f"💰 <b>Your Balance:</b> ${user_balance:.2f} USDT\n"
+            f"💵 <b>Cost:</b> ${price:.2f} USDT\n"
+            f"📉 <b>Balance after purchase:</b> ${balance_after:.2f} USDT"
+        )
+    else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [apply_button_style(InlineKeyboardButton(text="📥 Deposit Funds", callback_data="deposit"), 'primary')],
+            [apply_button_style(InlineKeyboardButton(
+                text="🔴 Cancel",
+                callback_data=f"product_{product_id}",
+            ), 'danger')],
+        ])
+        balance_line = (
+            f"💰 <b>Your Balance:</b> ${user_balance:.2f} USDT\n"
+            f"💵 <b>Required:</b> ${price:.2f} USDT\n\n"
+            f"❌ <b>Insufficient balance.</b> Please deposit funds first."
+        )
+
+    await query.message.edit_text(
+        f"🛒 <b>Confirm Purchase</b>\n\n"
+        f"📱 <b>Number:</b> <code>{p.phone_number}</code>\n"
+        f"🌍 <b>Country:</b> {get_country_flag(p.country)} {p.country.title()}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{balance_line}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{'Tap <b>Confirm Purchase</b> to proceed.' if can_afford else 'Deposit to unlock purchase.'}",
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.callback_query(F.data.startswith("buynowexec_"))
+async def cb_buynow_execute(query: CallbackQuery) -> None:
+    """Execute legacy single-number purchase after confirmation."""
+    await query.answer()
+    product_id = int(query.data.split("_")[1])
+    user_id = query.from_user.id
+
+    async with AsyncSessionFactory() as session:
+        result_p = await session.execute(select(Product).where(Product.id == product_id))
+        p = result_p.scalar_one_or_none()
+        if p is None or p.status != "Available":
+            await query.message.edit_text(
+                "❌ This number is no longer available.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="buy"), 'danger'),
+                ]]),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        user = await get_or_create_user(session, user_id, query.from_user.username,
+                                        first_name=query.from_user.first_name)
 
         if user.is_banned:
             await query.answer("🚫 You are banned from using this bot.", show_alert=True)
@@ -1969,7 +2191,7 @@ async def cb_buynow(query: CallbackQuery) -> None:
                 f"Required: <b>${p.price:.2f}</b>\n\n"
                 f"Please deposit funds first.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [apply_button_style(InlineKeyboardButton(text="🟢 Deposit", callback_data="deposit"), 'success')],
+                    [apply_button_style(InlineKeyboardButton(text="📥 Deposit", callback_data="deposit"), 'primary')],
                     [apply_button_style(InlineKeyboardButton(text="◀️ Back",    callback_data=f"product_{product_id}"), 'danger')],
                 ]),
                 parse_mode=ParseMode.HTML,
@@ -1978,7 +2200,10 @@ async def cb_buynow(query: CallbackQuery) -> None:
 
         new_balance = Decimal(str(user.balance)) - Decimal(str(p.price))
         await session.execute(
-            update(User).where(User.id == user_id).values(balance=new_balance)
+            update(User).where(User.id == user_id).values(
+                balance=new_balance,
+                numbers_bought=User.numbers_bought + 1,
+            )
         )
         await session.execute(
             update(Product).where(Product.id == product_id).values(status="Sold")
@@ -2011,11 +2236,15 @@ async def cb_buynow(query: CallbackQuery) -> None:
     if sess_str:
         await otp_manager.start_listener(pid, sess_str)
 
+    # Build session preview for success message
+    session_info = format_session_preview(sess_str)
+
     await query.message.edit_text(
         f"🎉 <b>Purchase Successful!</b>\n\n"
         f"📱 <b>Number:</b> <code>{phone}</code>\n"
         f"🌍 <b>Country:</b> {get_country_flag(country)} {country}\n"
-        f"💵 <b>Paid:</b> ${price:.2f} USDT\n\n"
+        f"💵 <b>Paid:</b> ${price:.2f} USDT\n"
+        f"{session_info}\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>📋 Next Steps:</b>\n"
         f"1️⃣ Open <b>Telegram / Telegram X / TurboTel</b>\n"
@@ -3301,12 +3530,16 @@ async def cb_purchase_detail(query: CallbackQuery) -> None:
             [apply_button_style(InlineKeyboardButton(text="◀️ My Purchases", callback_data="my_purchases"), 'danger')],
         ]
 
+    # Session string display
+    sess_line = format_session_full(p.session_string)
+
     await query.message.edit_text(
         f"📱 <b>{p.phone_number}</b>\n"
         f"🌍 Country: {get_country_flag(p.country)} {p.country}\n"
         f"💵 Price Paid: ${p.price:.2f} USDT\n"
         f"📅 Purchased: {dt}\n\n"
-        f"{otp_line}",
+        f"{otp_line}"
+        f"{sess_line}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
         parse_mode=ParseMode.HTML,
     )
