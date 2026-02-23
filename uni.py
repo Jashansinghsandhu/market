@@ -172,7 +172,7 @@ from cryptography.fernet import Fernet
 from eth_account import Account
 from sqlalchemy import (
     BigInteger, Boolean, Column, DateTime, Integer, Numeric,
-    String, Text, select, text, update,
+    String, Text, delete, select, text, update,
 )
 from sqlalchemy.exc import OperationalError as SAOperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -258,6 +258,7 @@ class Product(Base):
     status         = Column(String(16), default="Available")
     latest_otp     = Column(String(16), nullable=True)
     otp_updated_at = Column(DateTime, nullable=True)
+    year           = Column(Integer, nullable=True)  # For telegram_old_accounts
 
 
 class Transaction(Base):
@@ -308,6 +309,7 @@ async def init_db() -> None:
             "ALTER TABLE users ADD COLUMN numbers_bought INTEGER DEFAULT 0",
             "ALTER TABLE products ADD COLUMN category VARCHAR(32) DEFAULT 'telegram_accounts'",
             "ALTER TABLE transactions ADD COLUMN bonus NUMERIC(18, 6) DEFAULT 0",
+            "ALTER TABLE products ADD COLUMN year INTEGER",
         ]
         for migration in migrations:
             try:
@@ -775,6 +777,13 @@ class OTPSessionManager:
         return None, "No OTP found yet. Make sure you requested the code in Telegram."
 
     # ── Shutdown ──────────────────────────────────────────────────────────
+
+    async def stop_product(self, product_id: int) -> None:
+        """Cancel any listener task and stop the Pyrogram client for a product."""
+        old_task = self._tasks.pop(product_id, None)
+        if old_task and not old_task.done():
+            old_task.cancel()
+        await self._stop_client(product_id)
 
     async def shutdown(self) -> None:
         """Stop all running clients and cancel all tasks."""
@@ -1586,7 +1595,12 @@ async def cb_buy_category(query: CallbackQuery) -> None:
     if category == "telegram":
         # This is handled separately above
         return
-    
+
+    if category == CATEGORY_TELEGRAM_OLD:
+        # Show year selection instead of countries directly
+        await _show_old_account_years(query.message, edit=True)
+        return
+
     await _show_category_countries(query.message, category, page=0, edit=True)
 
 
@@ -1640,13 +1654,20 @@ async def _show_category_countries(
     total_pages = (len(countries_data) + PAGE_SIZE - 1) // PAGE_SIZE
     page_data = countries_data[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
 
-    buttons = [
-        [apply_button_style(InlineKeyboardButton(
+    # Build buttons 2 countries per row
+    buttons = []
+    row: list[InlineKeyboardButton] = []
+    for country, count in page_data:
+        btn = apply_button_style(InlineKeyboardButton(
             text=f"{get_country_flag(country)} {country.title()} ({count})",
             callback_data=f"cat_country_{category}|{country}",
-        ), 'primary')]
-        for country, count in page_data
-    ]
+        ), 'primary')
+        row.append(btn)
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
     
     nav_row: list[InlineKeyboardButton] = []
     if page > 0:
@@ -1943,15 +1964,420 @@ async def cb_buy_execute(query: CallbackQuery) -> None:
     if sess_str:
         await otp_manager.start_listener(pid, sess_str)
 
-    # Build session preview for success message
-    session_info = format_session_preview(sess_str)
+    # Session string is only shown for Telegram Sessions category
+    if category == CATEGORY_TELEGRAM_SESSIONS:
+        session_line = format_session_preview(sess_str) + "\n"
+    else:
+        session_line = ""
 
     await query.message.edit_text(
         f"🎉 <b>Purchase Successful!</b>\n\n"
         f"📱 <b>Number:</b> <code>{phone}</code>\n"
         f"🌍 <b>Country:</b> {get_country_flag(country)} {country.title()}\n"
         f"💵 <b>Paid:</b> ${price:.2f} USDT\n"
-        f"{session_info}\n"
+        f"{session_line}"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📋 <b>Next Steps:</b>\n"
+        f"1️⃣ Open <b>Telegram / Telegram X / TurboTel</b>\n"
+        f"2️⃣ Enter the number: <code>{phone}</code>\n"
+        f"3️⃣ Tap <b>Send Code</b> in Telegram\n"
+        f"4️⃣ Come back here and press <b>🔄 Get OTP</b>\n\n"
+        f"⚡ OTP is fetched <b>instantly</b> from the account!",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [apply_button_style(InlineKeyboardButton(text="🔄 Get OTP", callback_data=f"getotp_{pid}"), 'primary')],
+            [apply_button_style(InlineKeyboardButton(text="◀️ Main Menu", callback_data="back_main"), 'danger')],
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ── Telegram Old Accounts – Year-based Buy Flow ───────────────────────────────
+
+async def _show_old_account_years(message: Message, edit: bool = False) -> None:
+    """Show available years for Telegram Old Accounts (only years with stock)."""
+    async with AsyncSessionFactory() as session:
+        rows = await session.execute(
+            select(Product.year)
+            .where(
+                Product.category == CATEGORY_TELEGRAM_OLD,
+                Product.status == "Available",
+                Product.year.isnot(None),
+            )
+            .distinct()
+            .order_by(Product.year)
+        )
+        years = [r[0] for r in rows.fetchall()]
+
+    if not years:
+        text = "😔 No Telegram Old Accounts available right now.\n\nCheck back later!"
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="buy_cat_telegram"), 'danger'),
+        ]])
+        if edit:
+            await message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        else:
+            await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        return
+
+    # 3 year buttons per row
+    year_buttons: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for yr in years:
+        btn = apply_button_style(InlineKeyboardButton(
+            text=str(yr),
+            callback_data=f"tgold_yr_{yr}",
+        ), 'primary')
+        row.append(btn)
+        if len(row) == 3:
+            year_buttons.append(row)
+            row = []
+    if row:
+        year_buttons.append(row)
+    year_buttons.append([apply_button_style(InlineKeyboardButton(text="🔴 Back", callback_data="buy_cat_telegram"), 'danger')])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=year_buttons)
+    text_msg = (
+        "📱 <b>Telegram Old Accounts</b>\n\n"
+        "🗓️ <b>Select a Year:</b>\n"
+        "<i>Only years with available stock are shown</i>"
+    )
+    if edit:
+        await message.edit_text(text_msg, reply_markup=kb, parse_mode=ParseMode.HTML)
+    else:
+        await message.answer(text_msg, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data.startswith("tgold_yr_"))
+async def cb_tgold_year(query: CallbackQuery) -> None:
+    """User selected a year for Telegram Old Accounts."""
+    await query.answer()
+    try:
+        year = int(query.data.replace("tgold_yr_", ""))
+    except ValueError:
+        await query.answer("Invalid request", show_alert=True)
+        return
+    await _show_old_account_countries(query.message, year, edit=True)
+
+
+async def _show_old_account_countries(
+    message: Message, year: int, edit: bool = False
+) -> None:
+    """Show countries with available Telegram Old Accounts for a specific year (2 per row)."""
+    from sqlalchemy import func
+    async with AsyncSessionFactory() as session:
+        rows = await session.execute(
+            select(Product.country, func.count(Product.id).label("count"))
+            .where(
+                Product.category == CATEGORY_TELEGRAM_OLD,
+                Product.status == "Available",
+                Product.year == year,
+            )
+            .group_by(Product.country)
+            .order_by(Product.country)
+        )
+        countries_data = rows.fetchall()
+
+    if not countries_data:
+        text = f"😔 No Telegram Old Accounts available for {year}.\n\nCheck back later!"
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data=f"buy_cat_{CATEGORY_TELEGRAM_OLD}"), 'danger'),
+        ]])
+        if edit:
+            await message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        else:
+            await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        return
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    row_: list[InlineKeyboardButton] = []
+    for country, count in countries_data:
+        btn = apply_button_style(InlineKeyboardButton(
+            text=f"{get_country_flag(country)} {country.title()} ({count})",
+            callback_data=f"tgold_ctry_{year}|{country}",
+        ), 'primary')
+        row_.append(btn)
+        if len(row_) == 2:
+            buttons.append(row_)
+            row_ = []
+    if row_:
+        buttons.append(row_)
+    buttons.append([apply_button_style(InlineKeyboardButton(text="🔴 Back", callback_data=f"buy_cat_{CATEGORY_TELEGRAM_OLD}"), 'danger')])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    text_msg = (
+        f"📱 <b>Telegram Old Accounts ({year})</b>\n\n"
+        f"🌍 <b>Select a Country:</b>\n"
+        f"<i>Number in brackets = Available count</i>"
+    )
+    if edit:
+        await message.edit_text(text_msg, reply_markup=kb, parse_mode=ParseMode.HTML)
+    else:
+        await message.answer(text_msg, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data.startswith("tgold_ctry_"))
+async def cb_tgold_country(query: CallbackQuery) -> None:
+    """Show details for selected country/year in Telegram Old Accounts."""
+    await query.answer()
+    parts = query.data.replace("tgold_ctry_", "").split("|", 1)
+    if len(parts) != 2:
+        await query.answer("Invalid request", show_alert=True)
+        return
+    try:
+        year = int(parts[0])
+    except ValueError:
+        await query.answer("Invalid request", show_alert=True)
+        return
+    country = parts[1]
+
+    async with AsyncSessionFactory() as session:
+        rows = await session.execute(
+            select(Product)
+            .where(
+                Product.category == CATEGORY_TELEGRAM_OLD,
+                Product.country == country,
+                Product.year == year,
+                Product.status == "Available",
+            )
+            .order_by(Product.price)
+        )
+        products = rows.scalars().all()
+
+    if not products:
+        await query.message.edit_text(
+            f"😔 <b>No numbers available</b> for "
+            f"{get_country_flag(country)} {country.title()} ({year}) right now.\n\n"
+            f"Please check back later or choose another country.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data=f"tgold_yr_{year}"), 'danger'),
+            ]]),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    available_count = len(products)
+    price = products[0].price
+    await query.message.edit_text(
+        f"🌍 <b>{get_country_flag(country)} {country.title()}</b>\n"
+        f"📁 <b>Category:</b> 📱 Telegram Old Accounts ({year})\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📱 <b>Available Numbers:</b> {available_count}\n"
+        f"💰 <b>Price per Number:</b> ${price:.2f} USDT\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Click <b>Buy Now</b> to purchase a random number from this pool.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [apply_button_style(InlineKeyboardButton(text="🛒 Buy Now", callback_data=f"tgold_confirm_{year}|{country}"), 'primary')],
+            [apply_button_style(InlineKeyboardButton(text="🔴 Cancel", callback_data=f"tgold_yr_{year}"), 'danger')],
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.callback_query(F.data.startswith("tgold_confirm_"))
+async def cb_tgold_confirm(query: CallbackQuery) -> None:
+    """Show purchase confirmation for Telegram Old Accounts."""
+    await query.answer()
+    parts = query.data.replace("tgold_confirm_", "").split("|", 1)
+    if len(parts) != 2:
+        await query.answer("Invalid request", show_alert=True)
+        return
+    try:
+        year = int(parts[0])
+    except ValueError:
+        await query.answer("Invalid request", show_alert=True)
+        return
+    country = parts[1]
+    user_id = query.from_user.id
+
+    async with AsyncSessionFactory() as session:
+        user = await get_or_create_user(
+            session, user_id, query.from_user.username,
+            first_name=query.from_user.first_name,
+        )
+        if user.is_banned:
+            await query.answer("🚫 You are banned from using this bot.", show_alert=True)
+            return
+
+        rows = await session.execute(
+            select(Product)
+            .where(
+                Product.category == CATEGORY_TELEGRAM_OLD,
+                Product.country == country,
+                Product.year == year,
+                Product.status == "Available",
+            )
+            .order_by(Product.price)
+        )
+        products = rows.scalars().all()
+
+    if not products:
+        await query.message.edit_text(
+            "❌ <b>No Numbers Available</b>\n\nThis country's stock is now empty. "
+            "Please choose another country.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data=f"tgold_yr_{year}"), 'danger'),
+            ]]),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    price = Decimal(str(products[0].price))
+    available_count = len(products)
+    user_balance = Decimal(str(user.balance or 0))
+    can_afford = user_balance >= price
+    flag = get_country_flag(country)
+    balance_after = user_balance - price if can_afford else user_balance
+
+    if can_afford:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [apply_button_style(InlineKeyboardButton(
+                text="✅ Confirm Purchase",
+                callback_data=f"tgold_exec_{year}|{country}",
+            ), 'primary')],
+            [apply_button_style(InlineKeyboardButton(
+                text="🔴 Cancel",
+                callback_data=f"tgold_ctry_{year}|{country}",
+            ), 'danger')],
+        ])
+        balance_line = (
+            f"💰 <b>Your Balance:</b> ${user_balance:.2f} USDT\n"
+            f"💵 <b>Cost:</b> ${price:.2f} USDT\n"
+            f"📉 <b>Balance after purchase:</b> ${balance_after:.2f} USDT"
+        )
+    else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [apply_button_style(InlineKeyboardButton(text="📥 Deposit Funds", callback_data="deposit"), 'primary')],
+            [apply_button_style(InlineKeyboardButton(
+                text="🔴 Cancel",
+                callback_data=f"tgold_ctry_{year}|{country}",
+            ), 'danger')],
+        ])
+        balance_line = (
+            f"💰 <b>Your Balance:</b> ${user_balance:.2f} USDT\n"
+            f"💵 <b>Required:</b> ${price:.2f} USDT\n\n"
+            f"❌ <b>Insufficient balance.</b> Please deposit funds first."
+        )
+
+    await query.message.edit_text(
+        f"🛒 <b>Confirm Purchase</b>\n\n"
+        f"🌍 <b>Country:</b> {flag} {country.title()}\n"
+        f"📅 <b>Year:</b> {year}\n"
+        f"📱 <b>Available:</b> {available_count} number(s)\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{balance_line}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{'Tap <b>Confirm Purchase</b> to proceed.' if can_afford else 'Deposit to unlock purchase.'}",
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.callback_query(F.data.startswith("tgold_exec_"))
+async def cb_tgold_execute(query: CallbackQuery) -> None:
+    """Execute purchase for Telegram Old Accounts."""
+    await query.answer()
+    parts = query.data.replace("tgold_exec_", "").split("|", 1)
+    if len(parts) != 2:
+        await query.answer("Invalid request", show_alert=True)
+        return
+    try:
+        year = int(parts[0])
+    except ValueError:
+        await query.answer("Invalid request", show_alert=True)
+        return
+    country = parts[1]
+    user_id = query.from_user.id
+
+    async with AsyncSessionFactory() as session:
+        user = await get_or_create_user(
+            session, user_id, query.from_user.username,
+            first_name=query.from_user.first_name,
+        )
+        if user.is_banned:
+            await query.answer("🚫 You are banned from using this bot.", show_alert=True)
+            return
+
+        rows = await session.execute(
+            select(Product)
+            .where(
+                Product.category == CATEGORY_TELEGRAM_OLD,
+                Product.country == country,
+                Product.year == year,
+                Product.status == "Available",
+            )
+        )
+        available_products = rows.scalars().all()
+
+        if not available_products:
+            await query.message.edit_text(
+                "❌ <b>No numbers available.</b>\n\nThis stock just ran out. "
+                "Please try another country.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data=f"tgold_yr_{year}"), 'danger'),
+                ]]),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        product = secrets.choice(available_products)
+
+        if Decimal(str(user.balance)) < Decimal(str(product.price)):
+            await query.message.edit_text(
+                f"❌ <b>Insufficient Balance</b>\n\n"
+                f"💰 Your balance: <b>${user.balance:.2f}</b>\n"
+                f"💵 Required: <b>${product.price:.2f}</b>\n\n"
+                f"Please deposit funds first.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [apply_button_style(InlineKeyboardButton(text="📥 Deposit", callback_data="deposit"), 'primary')],
+                    [apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data=f"tgold_ctry_{year}|{country}"), 'danger')],
+                ]),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        new_balance = Decimal(str(user.balance)) - Decimal(str(product.price))
+        await session.execute(
+            update(User)
+            .where(User.id == user_id)
+            .values(balance=new_balance, numbers_bought=User.numbers_bought + 1)
+        )
+        await session.execute(
+            update(Product).where(Product.id == product.id).values(status="Sold")
+        )
+        order = Order(user_id=user_id, product_id=product.id, status="Completed")
+        session.add(order)
+        await session.flush()
+        txn = Transaction(
+            user_id=user_id, order_id=order.id,
+            type="Purchase", amount=product.price, status="Completed",
+        )
+        session.add(txn)
+        await session.commit()
+
+        phone = product.phone_number
+        price = product.price
+        sess_str = product.session_string
+        pid = product.id
+
+    # Clear any stale OTP
+    async with AsyncSessionFactory() as session:
+        await session.execute(
+            update(Product)
+            .where(Product.id == pid)
+            .values(latest_otp=None, otp_updated_at=None)
+        )
+        await session.commit()
+
+    if sess_str:
+        await otp_manager.start_listener(pid, sess_str)
+
+    # Old accounts show only OTP, not session string
+    await query.message.edit_text(
+        f"🎉 <b>Purchase Successful!</b>\n\n"
+        f"📱 <b>Number:</b> <code>{phone}</code>\n"
+        f"🌍 <b>Country:</b> {get_country_flag(country)} {country.title()}\n"
+        f"📅 <b>Year:</b> {year}\n"
+        f"💵 <b>Paid:</b> ${price:.2f} USDT\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"📋 <b>Next Steps:</b>\n"
         f"1️⃣ Open <b>Telegram / Telegram X / TurboTel</b>\n"
@@ -2224,6 +2650,7 @@ async def cb_buynow_execute(query: CallbackQuery) -> None:
         country = p.country
         sess_str = p.session_string
         pid = p.id
+        p_category = p.category
 
     # Clear any stale OTP from previous ownership
     async with AsyncSessionFactory() as session:
@@ -2238,15 +2665,18 @@ async def cb_buynow_execute(query: CallbackQuery) -> None:
     if sess_str:
         await otp_manager.start_listener(pid, sess_str)
 
-    # Build session preview for success message
-    session_info = format_session_preview(sess_str)
+    # Session string is only shown for Telegram Sessions category
+    if p_category == CATEGORY_TELEGRAM_SESSIONS:
+        session_line = format_session_preview(sess_str) + "\n"
+    else:
+        session_line = ""
 
     await query.message.edit_text(
         f"🎉 <b>Purchase Successful!</b>\n\n"
         f"📱 <b>Number:</b> <code>{phone}</code>\n"
         f"🌍 <b>Country:</b> {get_country_flag(country)} {country}\n"
         f"💵 <b>Paid:</b> ${price:.2f} USDT\n"
-        f"{session_info}\n"
+        f"{session_line}"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>📋 Next Steps:</b>\n"
         f"1️⃣ Open <b>Telegram / Telegram X / TurboTel</b>\n"
@@ -2486,18 +2916,70 @@ async def cb_admin_add_number(query: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data.startswith("admin_add_cat_"))
 @admin_only
 async def cb_admin_add_category(query: CallbackQuery, state: FSMContext) -> None:
-    """Category selected, now ask for country."""
+    """Category selected, now ask for country (or year for old accounts)."""
     await query.answer()
     category = query.data.replace("admin_add_cat_", "")
     category_name = PRODUCT_CATEGORIES.get(category, "Unknown")
     
     await state.update_data(category=category)
+
+    if category == CATEGORY_TELEGRAM_OLD:
+        # Show year selection buttons (2013–2024, 12 years)
+        year_buttons: list[list[InlineKeyboardButton]] = []
+        row: list[InlineKeyboardButton] = []
+        for yr in range(2013, 2025):
+            btn = apply_button_style(InlineKeyboardButton(
+                text=str(yr),
+                callback_data=f"admin_add_year_{yr}",
+            ), 'primary')
+            row.append(btn)
+            if len(row) == 4:
+                year_buttons.append(row)
+                row = []
+        if row:
+            year_buttons.append(row)
+        year_buttons.append([apply_button_style(InlineKeyboardButton(text="❌ Cancel", callback_data="admin_cancel_add"), 'danger')])
+        await query.message.edit_text(
+            f"➕ <b>Add New Number</b>\n\n"
+            f"📁 Category: <b>{category_name}</b>\n\n"
+            f"Step 2/6: Select the <b>account year</b>:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=year_buttons),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     await state.set_state(AdminAddNumber.country)
     
     await query.message.edit_text(
         f"➕ <b>Add New Number</b>\n\n"
         f"📁 Category: <b>{category_name}</b>\n\n"
         f"Step 2/5: Enter the <b>country name</b>:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            apply_button_style(InlineKeyboardButton(text="❌ Cancel", callback_data="admin_cancel_add"), 'danger'),
+        ]]),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.callback_query(F.data.startswith("admin_add_year_"))
+@admin_only
+async def cb_admin_add_year(query: CallbackQuery, state: FSMContext) -> None:
+    """Year selected for Telegram Old Accounts, now ask for country."""
+    await query.answer()
+    try:
+        year = int(query.data.replace("admin_add_year_", ""))
+    except ValueError:
+        await query.answer("Invalid year.", show_alert=True)
+        return
+
+    await state.update_data(year=year)
+    await state.set_state(AdminAddNumber.country)
+
+    await query.message.edit_text(
+        f"➕ <b>Add New Number</b>\n\n"
+        f"📁 Category: <b>📱 Telegram Old Accounts</b>\n"
+        f"📅 Year: <b>{year}</b>\n\n"
+        f"Step 3/6: Enter the <b>country name</b>:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             apply_button_style(InlineKeyboardButton(text="❌ Cancel", callback_data="admin_cancel_add"), 'danger'),
         ]]),
@@ -2571,14 +3053,18 @@ async def fsm_add_session_string(message: Message, state: FSMContext) -> None:
             price=Decimal(data["price"]),
             session_string=session_str,
             status="Available",
+            year=data.get("year"),
         )
         session.add(product)
         await session.commit()
 
+    year = data.get("year")
+    year_line = f"📅 Year: <b>{year}</b>\n" if year else ""
     await state.clear()
     await message.answer(
         f"✅ <b>Number Added Successfully!</b>\n\n"
         f"📁 Category: <b>{category_name}</b>\n"
+        f"{year_line}"
         f"📱 Number: <b>{data['phone']}</b>\n"
         f"🌍 Country: <b>{get_country_flag(data['country'])} {data['country'].title()}</b>\n"
         f"💰 Price: <b>${data['price']} USDT</b>\n"
@@ -3022,6 +3508,7 @@ async def cmd_help(message: Message) -> None:
         "/admin – Open the Admin Panel\n"
         "/tip @username amount – Add balance to a user\n"
         "/setbal @username amount – Set exact balance for a user\n"
+        "/remove +phonenumber – Delete a number and all its data\n"
         "/help – Show this help message\n\n"
         "<b>Admin Panel Features:</b>\n"
         "➕ <b>Add Number</b> – Add a new virtual number to inventory\n"
@@ -3036,7 +3523,66 @@ async def cmd_help(message: Message) -> None:
         "📦 Purchases – View all purchases with OTP status\n\n"
         "<b>Notes:</b>\n"
         "• /setbal can use @username or numeric Telegram ID\n"
-        "• /tip adds to existing balance; /setbal sets exact amount",
+        "• /tip adds to existing balance; /setbal sets exact amount\n"
+        "• /remove permanently deletes the number and its session string",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ── /remove command ───────────────────────────────────────────────────────────
+
+@router.message(Command("remove"))
+@admin_only
+async def cmd_remove(message: Message) -> None:
+    """Delete a phone number and all associated data from the bot."""
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "❌ Usage: <code>/remove +phonenumber</code>\n"
+            "Example: <code>/remove +919876543210</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    phone_number = parts[1].strip()
+
+    async with AsyncSessionFactory() as session:
+        result = await session.execute(
+            select(Product).where(Product.phone_number == phone_number)
+        )
+        product = result.scalar_one_or_none()
+
+        if product is None:
+            await message.answer(
+                f"❌ Number <code>{phone_number}</code> not found in the database.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        pid = product.id
+
+        # Remove associated orders and their transactions
+        ord_rows = await session.execute(
+            select(Order).where(Order.product_id == pid)
+        )
+        orders = ord_rows.scalars().all()
+        for order in orders:
+            await session.execute(
+                delete(Transaction).where(Transaction.order_id == order.id)
+            )
+        await session.execute(delete(Order).where(Order.product_id == pid))
+
+        # Delete the product (session_string is stored in the product row)
+        await session.execute(delete(Product).where(Product.id == pid))
+        await session.commit()
+
+    # Stop any running OTP listener for this product
+    await otp_manager.stop_product(pid)
+
+    await message.answer(
+        f"✅ <b>Number Removed</b>\n\n"
+        f"📱 <code>{phone_number}</code> and all associated data "
+        f"(session string, orders, transactions) have been permanently deleted.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -3532,8 +4078,11 @@ async def cb_purchase_detail(query: CallbackQuery) -> None:
             [apply_button_style(InlineKeyboardButton(text="◀️ My Purchases", callback_data="my_purchases"), 'danger')],
         ]
 
-    # Session string display
-    sess_line = format_session_full(p.session_string)
+    # Session string display – only for Telegram Sessions category
+    if p.category == CATEGORY_TELEGRAM_SESSIONS:
+        sess_line = "\n" + format_session_full(p.session_string)
+    else:
+        sess_line = ""
 
     await query.message.edit_text(
         f"📱 <b>{p.phone_number}</b>\n"
