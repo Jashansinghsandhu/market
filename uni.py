@@ -223,7 +223,7 @@ except ImportError:
 #  DATABASE MODELS
 # ─────────────────────────────────────────────────────────────────────────────
 
-engine = create_async_engine(DATABASE_URL, echo=False, pool_size=10, max_overflow=20, pool_pre_ping=True)
+engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
 AsyncSessionFactory = async_sessionmaker(engine, expire_on_commit=False)
 
 
@@ -621,8 +621,8 @@ class OTPSessionManager:
         # Immediate first scan
         await self._scan_and_store(product_id, client)
 
-        end_time = asyncio.get_event_loop().time() + _LISTENER_LIFETIME
-        while asyncio.get_event_loop().time() < end_time:
+        end_time = asyncio.get_running_loop().time() + _LISTENER_LIFETIME
+        while asyncio.get_running_loop().time() < end_time:
             await asyncio.sleep(5)
             try:
                 if not client.is_connected:
@@ -3389,12 +3389,11 @@ async def _check_deposits(bot: Bot) -> None:
             continue
 
         try:
-            transfer_filter = contract.events.Transfer.create_filter(
-                from_block=from_block + 1,
-                to_block=latest_block,
+            events = await contract.events.Transfer.get_logs(
+                fromBlock=from_block + 1,
+                toBlock=latest_block,
                 argument_filters={"to": checksum_addr},
             )
-            events = await transfer_filter.get_all_entries()
         except Exception as exc:
             log.warning("Filter error for %s: %s", wallet_addr, exc)
             _last_scanned_block[wallet_addr] = latest_block
@@ -3583,7 +3582,7 @@ async def main() -> None:
     asyncio.create_task(oxapay_payment_monitor(bot))
 
     # Save blockchain state on graceful shutdown (SIGINT / SIGTERM)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, _save_blockchain_state)
