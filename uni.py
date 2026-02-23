@@ -2,8 +2,8 @@
 Telegram Marketplace Bot
 ========================
 A production-ready Telegram Bot Marketplace for purchasing virtual numbers
-(Telegram accounts). Includes a user storefront, admin panel, referral system,
-an automated USDT BEP-20 crypto payment gateway on Binance Smart Chain, and
+(Telegram accounts, sessions, WhatsApp SMS). Includes a user storefront, 
+admin panel, referral system, OxaPay crypto payment gateway, and
 fully automated OTP delivery via pre-registered Pyrogram session strings.
 
 HOW TO RUN:
@@ -17,7 +17,7 @@ SETUP GUIDE:
     1. Set BOT_TOKEN to your @BotFather token.
     2. Set ADMIN_IDS to your Telegram user ID(s).
     3. Set TELEGRAM_API_ID and TELEGRAM_API_HASH from https://my.telegram.org.
-    4. (Optional) Customise the BSC/wallet config for crypto payments.
+    4. Set OXAPAY_API_KEY from your OxaPay merchant dashboard.
     5. Generate Pyrogram session strings for your phone numbers using
        the included generate_session.py script:
            python generate_session.py
@@ -32,7 +32,13 @@ DATA PERSISTENCE:
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  CONFIGURATION
-# ───────────────────────────────────────────��─────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTE: For production use, move sensitive credentials to environment variables:
+#   BOT_TOKEN = os.getenv("BOT_TOKEN")
+#   OXAPAY_API_KEY = os.getenv("OXAPAY_API_KEY")
+#   MASTER_WALLET_PRIVATE_KEY = os.getenv("WALLET_PRIVATE_KEY")
+#   etc.
+# ─────────────────────────────────────────────────────────────────────────────
 
 BOT_TOKEN = "8320586826:AAGsP6LgRM0nKXw_eb9NU7cP0TMo7LSTBqc"
 
@@ -40,6 +46,12 @@ ADMIN_IDS: list[int] = [6083286836]
 
 TELEGRAM_API_ID: int   = 31706595
 TELEGRAM_API_HASH: str = "6e70d58c2db95a6558486e6b22fbfd45"
+
+# OxaPay Configuration
+OXAPAY_API_KEY = "sandbox"  # Replace with your actual OxaPay merchant API key
+OXAPAY_API_URL = "https://api.oxapay.com/merchants/request"
+OXAPAY_INQUIRY_URL = "https://api.oxapay.com/merchants/inquiry"
+OXAPAY_CALLBACK_DOMAIN = "play-casino.app"
 
 MASTER_WALLET_ADDRESS  = "0xD303d819DA527b6b402ae61B0405b5E65fA69292"
 MASTER_WALLET_PRIVATE_KEY = "9cc02e54a5ce2b9ec69f121ce3b48c075017b63f3c0492a23b007305ca36093d"
@@ -51,28 +63,33 @@ BSC_RPC_URL = "https://bsc-mainnet.nodereal.io/v1/1d9d76352b8c443587521a782cfe55
 USDT_CONTRACT_ADDRESS = "0x55d398326f99059fF775485246999027B3197955"
 
 BLOCKCHAIN_POLL_INTERVAL = 30
+OXAPAY_POLL_INTERVAL = 30  # Check OxaPay payments every 30 seconds
 GAS_BNB_AMOUNT = 0.001
 BNB_CONFIRMATION_WAIT_SECONDS = 5
 REFERRAL_COMMISSION_PCT = 1.5
-SUPPORT_USERNAME = "@jashanxjagy"
+SUPPORT_USERNAME = "jashanxjagy"  # Without @ prefix (added in URLs)
 DATABASE_URL = "sqlite+aiosqlite:///marketplace.db"
 BLOCKCHAIN_STATE_FILE = "blockchain_state.json"
 FERNET_KEY = "m8gzSFYcYk41uYxNUqCwpn-YGvo1_sVwDNTg-2FgBTg="
 
-WELCOME_TEXT = (
-    "🥂 <b>Welcome To Otp Bot By JATINYADV001</b> 🥂\n\n"
-    "- Automatic OTPs 📍\n"
-    "- Easy to Use 🥂🥂\n"
-    "- 24/7 Support 👨‍🔧\n"
-    "- Instant Payment Approvals 🧾\n\n\n"
-    "🚀 <b>How to use Bot :</b>\n"
-    "1️⃣ Recharge\n"
-    "2️⃣ Select Country\n"
-    "3️⃣ Buy Account\n"
-    "4️⃣ Get Number &amp; Login through Telegram / Telegram X / TurboTel\n"
-    "5️⃣ Receive OTP &amp; You're Done ✅\n\n"
-    "🚀 Enjoy Fast Account Buying Experience!"
-)
+# Deposit bonus configuration
+DEPOSIT_BONUSES = {
+    20: 5,    # 5% bonus for $20 deposit
+    50: 10,   # 10% bonus for $50 deposit
+}
+
+# Product categories
+CATEGORY_TELEGRAM_ACCOUNTS = "telegram_accounts"
+CATEGORY_TELEGRAM_OLD = "telegram_old_accounts"
+CATEGORY_TELEGRAM_SESSIONS = "telegram_sessions"
+CATEGORY_WHATSAPP_SMS = "whatsapp_sms"
+
+PRODUCT_CATEGORIES = {
+    CATEGORY_TELEGRAM_ACCOUNTS: "📱 Telegram Accounts",
+    CATEGORY_TELEGRAM_OLD: "📱 Telegram Old Accounts",
+    CATEGORY_TELEGRAM_SESSIONS: "🔐 Telegram Sessions",
+    CATEGORY_WHATSAPP_SMS: "💬 WhatsApp SMS",
+}
 
 COUNTRY_FLAGS: dict[str, str] = {
     "india": "🇮🇳", "pakistan": "🇵🇰", "bangladesh": "🇧🇩",
@@ -139,13 +156,17 @@ import io
 import json
 import logging
 import os
+import random
 import re
+import secrets
 import signal
 import traceback
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
+import aiohttp
 import qrcode
 from cryptography.fernet import Fernet
 from eth_account import Account
@@ -214,7 +235,11 @@ class User(Base):
     __tablename__ = "users"
     id                     = Column(BigInteger, primary_key=True)
     username               = Column(String(128), nullable=True)
+    first_name             = Column(String(128), nullable=True)
     balance                = Column(Numeric(18, 6), default=0)
+    total_deposited        = Column(Numeric(18, 6), default=0)
+    total_bonus_received   = Column(Numeric(18, 6), default=0)
+    numbers_bought         = Column(Integer, default=0)
     deposit_wallet_address = Column(String(64), unique=True, nullable=True)
     deposit_wallet_privkey = Column(Text, nullable=True)
     referred_by            = Column(BigInteger, nullable=True)
@@ -225,6 +250,7 @@ class User(Base):
 class Product(Base):
     __tablename__ = "products"
     id             = Column(Integer, primary_key=True, autoincrement=True)
+    category       = Column(String(32), nullable=False, default="telegram_accounts")
     country        = Column(String(64), nullable=False)
     phone_number   = Column(String(32), nullable=False, unique=True)
     price          = Column(Numeric(18, 6), nullable=False)
@@ -241,6 +267,7 @@ class Transaction(Base):
     order_id   = Column(Integer, nullable=True)
     type       = Column(String(32), nullable=False)
     amount     = Column(Numeric(18, 6), nullable=False)
+    bonus      = Column(Numeric(18, 6), default=0)
     tx_hash    = Column(String(128), nullable=True)
     status     = Column(String(16), default="Pending")
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -255,16 +282,38 @@ class Order(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class OxaPayPayment(Base):
+    """Track OxaPay payment requests."""
+    __tablename__ = "oxapay_payments"
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    user_id      = Column(BigInteger, nullable=False)
+    track_id     = Column(String(64), unique=True, nullable=False)
+    amount       = Column(Numeric(18, 6), nullable=False)
+    bonus_amount = Column(Numeric(18, 6), default=0)
+    status       = Column(String(32), default="Waiting")  # Waiting, Confirming, Confirmed, Expired, Failed
+    pay_link     = Column(Text, nullable=True)
+    created_at   = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at   = Column(DateTime, nullable=True)
+
+
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Migration: add is_banned column to existing databases
-        try:
-            await conn.execute(
-                text("ALTER TABLE users ADD COLUMN is_banned BOOLEAN NOT NULL DEFAULT 0")
-            )
-        except SAOperationalError:
-            pass  # Column already exists
+        # Migration: add new columns to existing databases
+        migrations = [
+            "ALTER TABLE users ADD COLUMN is_banned BOOLEAN NOT NULL DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN first_name VARCHAR(128)",
+            "ALTER TABLE users ADD COLUMN total_deposited NUMERIC(18, 6) DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN total_bonus_received NUMERIC(18, 6) DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN numbers_bought INTEGER DEFAULT 0",
+            "ALTER TABLE products ADD COLUMN category VARCHAR(32) DEFAULT 'telegram_accounts'",
+            "ALTER TABLE transactions ADD COLUMN bonus NUMERIC(18, 6) DEFAULT 0",
+        ]
+        for migration in migrations:
+            try:
+                await conn.execute(text(migration))
+            except SAOperationalError:
+                pass  # Column already exists
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -305,41 +354,107 @@ def get_country_flag(country: str) -> str:
     return COUNTRY_FLAGS.get(country.lower().strip(), "🌍")
 
 
+def get_welcome_text(first_name: str, balance: Decimal) -> str:
+    """Generate personalized welcome text with user's name and balance."""
+    return (
+        f"✨ <b>Hey {first_name}! Ready to explore?</b> ✨\n\n"
+        f"💰 <b>Your Balance:</b> ${balance:.2f} USDT\n\n"
+        f"🎯 What are you in the mood for today?\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔥 <b>Premium Accounts</b> • Instant OTPs\n"
+        f"⚡ <b>Lightning Fast</b> • Auto Delivery\n"
+        f"🛡️ <b>24/7 Support</b> • Secure Payments\n"
+        f"━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+def get_help_text() -> str:
+    """Generate comprehensive help text."""
+    return (
+        "📖 <b>Complete Guide to Our Bot</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "💎 <b>1. DEPOSIT FUNDS</b>\n"
+        "• Tap 📥 Deposit → OxaPay Crypto\n"
+        "• Select an amount or enter custom\n"
+        "• Complete payment via crypto\n"
+        "• Balance updates automatically!\n\n"
+        "🛒 <b>2. BUY ACCOUNTS</b>\n"
+        "• Tap 🛍️ Buy Accounts\n"
+        "• Choose category (Telegram/WhatsApp)\n"
+        "• Select a country from the list\n"
+        "• Tap Buy Now if balance is sufficient\n\n"
+        "📲 <b>3. GET YOUR OTP</b>\n"
+        "• After purchase, use the number in Telegram\n"
+        "• Request login code in Telegram app\n"
+        "• Come back & tap 🔄 Get OTP\n"
+        "• Code appears instantly!\n\n"
+        "👥 <b>4. REFERRAL PROGRAM</b>\n"
+        f"• Earn {REFERRAL_COMMISSION_PCT}% on referral deposits\n"
+        "• Share your unique link\n"
+        "• Track earnings in Referral section\n\n"
+        "👤 <b>5. PROFILE</b>\n"
+        "• View your complete statistics\n"
+        "• Check purchase history\n"
+        "• Monitor bonus earnings\n\n"
+        "🆘 <b>NEED HELP?</b>\n"
+        f"Contact: @{SUPPORT_USERNAME}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
 async def get_or_create_user(
     session: AsyncSession,
     telegram_id: int,
     username: Optional[str],
+    first_name: Optional[str] = None,
     referred_by: Optional[int] = None,
 ) -> User:
     result = await session.execute(select(User).where(User.id == telegram_id))
     user = result.scalar_one_or_none()
     if user is None:
         user = User(
-            id=telegram_id, username=username, balance=Decimal("0"),
+            id=telegram_id, 
+            username=username, 
+            first_name=first_name or "User",
+            balance=Decimal("0"),
             referred_by=referred_by,
         )
         session.add(user)
         await session.commit()
         await session.refresh(user)
+    else:
+        # Update first_name if provided and different
+        if first_name and user.first_name != first_name:
+            user.first_name = first_name
+            await session.commit()
     return user
 
 
 def build_main_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
+    """Build the main menu with styled inline buttons.
+    
+    Note: Telegram Bot API 7.3+ (Feb 2024) introduced button styling parameters.
+    Currently using emoji-based visual styling for compatibility.
+    """
     buttons = [
+        # Row 1: Buy Accounts (wider)
         [
-            InlineKeyboardButton(text="🔵 Buy Accounts", callback_data="buy"),
-            InlineKeyboardButton(text="🔵 Balance",      callback_data="balance"),
+            InlineKeyboardButton(text="🛍️ Buy Accounts", callback_data="buy"),
         ],
+        # Row 2: Deposit + Profile
         [
-            InlineKeyboardButton(text="🟢 Deposit",  callback_data="deposit"),
+            InlineKeyboardButton(text="📥 Deposit", callback_data="deposit"),
+            InlineKeyboardButton(text="👤 Profile", callback_data="profile"),
+        ],
+        # Row 3: Referral + Help
+        [
             InlineKeyboardButton(text="🤝 Referral", callback_data="referral"),
+            InlineKeyboardButton(text="❓ Help", callback_data="help"),
         ],
-        [
-            InlineKeyboardButton(text="📦 My Purchases", callback_data="my_purchases"),
-        ],
+        # Row 4: Support (redirect to telegram)
         [
             InlineKeyboardButton(
-                text="🎧 Support",
+                text="🆘 Support",
                 url=f"https://t.me/{SUPPORT_USERNAME}",
             ),
         ],
@@ -743,6 +858,7 @@ async def sweep_usdt(
 # ─────────────────────────────────────────────────────────────────────────────
 
 class AdminAddNumber(StatesGroup):
+    category       = State()
     country        = State()
     phone          = State()
     price          = State()
@@ -759,6 +875,10 @@ class AdminBroadcast(StatesGroup):
 
 class AdminSearchUser(StatesGroup):
     user_input = State()
+
+
+class OxaPayCustomAmount(StatesGroup):
+    amount = State()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -786,16 +906,22 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
     async with AsyncSessionFactory() as session:
         user = await get_or_create_user(
-            session, message.from_user.id, message.from_user.username,
+            session, 
+            message.from_user.id, 
+            message.from_user.username,
+            first_name=message.from_user.first_name or "User",
             referred_by=referred_by,
         )
         if user.is_banned:
             await message.answer("🚫 You have been banned from using this bot.")
             return
+        balance = Decimal(str(user.balance or 0))
+        first_name = user.first_name or message.from_user.first_name or "User"
 
     is_admin = message.from_user.id in ADMIN_IDS
+    welcome_text = get_welcome_text(first_name, balance)
     await message.answer(
-        WELCOME_TEXT,
+        welcome_text,
         reply_markup=build_main_keyboard(is_admin),
         parse_mode=ParseMode.HTML,
     )
@@ -804,26 +930,93 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 @router.message(Command("menu"))
 async def cmd_menu(message: Message, state: FSMContext) -> None:
     await state.clear()
+    async with AsyncSessionFactory() as session:
+        user = await get_or_create_user(
+            session,
+            message.from_user.id,
+            message.from_user.username,
+            first_name=message.from_user.first_name or "User",
+        )
+        balance = Decimal(str(user.balance or 0))
+        first_name = user.first_name or message.from_user.first_name or "User"
+    
     is_admin = message.from_user.id in ADMIN_IDS
+    welcome_text = get_welcome_text(first_name, balance)
     await message.answer(
-        WELCOME_TEXT, reply_markup=build_main_keyboard(is_admin),
+        welcome_text, 
+        reply_markup=build_main_keyboard(is_admin),
         parse_mode=ParseMode.HTML,
     )
 
 
-# ── Balance ───────────────────────────────────────────────────────────────────
+# ── Profile ───────────────────────────────────────────────────────────────────
 
-@router.callback_query(F.data == "balance")
-async def cb_balance(query: CallbackQuery) -> None:
+@router.callback_query(F.data == "profile")
+async def cb_profile(query: CallbackQuery) -> None:
+    user_id = query.from_user.id
     async with AsyncSessionFactory() as session:
         user = await get_or_create_user(
-            session, query.from_user.id, query.from_user.username
+            session, user_id, query.from_user.username,
+            first_name=query.from_user.first_name,
         )
+        
+        # Get referral count
+        ref_result = await session.execute(
+            select(User).where(User.referred_by == user_id)
+        )
+        referrals = ref_result.scalars().all()
+        
+        # Get purchase count
+        ord_result = await session.execute(
+            select(Order).where(Order.user_id == user_id, Order.status == "Completed")
+        )
+        purchases = ord_result.scalars().all()
+        
+        # Get bonus transactions
+        bonus_result = await session.execute(
+            select(Transaction).where(
+                Transaction.user_id == user_id,
+                Transaction.type.in_(["ReferralBonus", "DepositBonus"]),
+            )
+        )
+        bonuses = bonus_result.scalars().all()
+        total_bonus = sum(Decimal(str(b.amount)) for b in bonuses)
+
+    first_name = user.first_name or query.from_user.first_name or "User"
+    joined = user.created_at.strftime("%Y-%m-%d") if user.created_at else "N/A"
+    
     await query.message.edit_text(
-        f"💰 Your current balance: <b>${user.balance:.2f} USDT</b>",
+        f"👤 <b>Your Profile</b>\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 <b>User ID:</b> <code>{user.id}</code>\n"
+        f"📛 <b>Name:</b> {first_name}\n"
+        f"👤 <b>Username:</b> @{user.username or 'Not set'}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 <b>Balance:</b> ${user.balance:.2f} USDT\n"
+        f"💎 <b>Total Deposited:</b> ${user.total_deposited or 0:.2f}\n"
+        f"🎁 <b>Total Bonus:</b> ${total_bonus:.2f}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📱 <b>Numbers Bought:</b> {len(purchases)}\n"
+        f"👥 <b>Total Referrals:</b> {len(referrals)}\n"
+        f"📅 <b>Joined:</b> {joined}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📦 My Purchases", callback_data="my_purchases")],
+            [InlineKeyboardButton(text="◀️ Back", callback_data="back_main")],
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
+    await query.answer()
+
+
+# ── Help ──────────────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "help")
+async def cb_help(query: CallbackQuery) -> None:
+    await query.message.edit_text(
+        get_help_text(),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="🟢 Deposit", callback_data="deposit"),
-            InlineKeyboardButton(text="◀️ Back",    callback_data="back_main"),
+            InlineKeyboardButton(text="◀️ Back", callback_data="back_main"),
         ]]),
         parse_mode=ParseMode.HTML,
     )
@@ -834,51 +1027,482 @@ async def cb_balance(query: CallbackQuery) -> None:
 
 @router.message(Command("deposit"))
 async def cmd_deposit(message: Message) -> None:
-    await _show_deposit(message, message.from_user.id, message.from_user.username)
+    """Show deposit options menu."""
+    await message.answer(
+        "💳 <b>Deposit Funds</b>\n\n"
+        "Choose your preferred deposit method:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💎 OxaPay Crypto", callback_data="oxapay_menu")],
+            [InlineKeyboardButton(text="🔴 Cancel", callback_data="back_main")],
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @router.callback_query(F.data == "deposit")
 async def cb_deposit(query: CallbackQuery) -> None:
-    await _show_deposit(
-        query.message, query.from_user.id, query.from_user.username, edit=True,
+    """Show deposit options menu."""
+    await query.message.edit_text(
+        "💳 <b>Deposit Funds</b>\n\n"
+        "Choose your preferred deposit method:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💎 OxaPay Crypto", callback_data="oxapay_menu")],
+            [InlineKeyboardButton(text="🔴 Back", callback_data="back_main")],
+        ]),
+        parse_mode=ParseMode.HTML,
     )
     await query.answer()
 
 
-async def _show_deposit(
-    message: Message, user_id: int, username: Optional[str], edit: bool = False,
-) -> None:
-    async with AsyncSessionFactory() as session:
-        user = await get_or_create_user(session, user_id, username)
-        if not user.deposit_wallet_address:
-            address, privkey = generate_wallet()
-            await session.execute(
-                update(User).where(User.id == user_id).values(
-                    deposit_wallet_address=address,
-                    deposit_wallet_privkey=encrypt_privkey(privkey),
-                )
-            )
-            await session.commit()
-            wallet_address = address
-        else:
-            wallet_address = user.deposit_wallet_address
+# ── OxaPay Payment System ─────────────────────────────────────────────────────
 
-    qr_bytes = make_qr_bytes(wallet_address)
-    caption = (
-        f"🟢 <b>Deposit USDT (BEP-20)</b>\n\n"
-        f"Send <b>only USDT</b> on the <b>BNB Smart Chain (BEP-20)</b> network "
-        f"to the address below.\n\n"
-        f"<code>{wallet_address}</code>\n\n"
-        f"⚠️ Do <b>NOT</b> send any other token or use a different network.\n"
-        f"Your balance will be credited automatically after 1 confirmation."
+@router.callback_query(F.data == "oxapay_menu")
+async def cb_oxapay_menu(query: CallbackQuery) -> None:
+    """Show OxaPay amount selection menu."""
+    await query.message.edit_text(
+        "💎 <b>OxaPay Crypto Deposit</b>\n\n"
+        "Select the amount to deposit:\n\n"
+        "💡 <i>Bonus amounts are added to your balance after payment!</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            # Row 1: $1, $5, $10
+            [
+                InlineKeyboardButton(text="💵 $1", callback_data="oxapay_1"),
+                InlineKeyboardButton(text="💵 $5", callback_data="oxapay_5"),
+                InlineKeyboardButton(text="💵 $10", callback_data="oxapay_10"),
+            ],
+            # Row 2: $20 (5% bonus), $50 (10% bonus)
+            [
+                InlineKeyboardButton(text="💵 $20 (+5%)", callback_data="oxapay_20"),
+                InlineKeyboardButton(text="💵 $50 (+10%)", callback_data="oxapay_50"),
+            ],
+            # Row 3: Custom amount
+            [InlineKeyboardButton(text="✏️ Custom Amount", callback_data="oxapay_custom")],
+            # Row 4: Cancel
+            [InlineKeyboardButton(text="🔴 Cancel", callback_data="back_main")],
+        ]),
+        parse_mode=ParseMode.HTML,
     )
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="◀️ Back", callback_data="back_main"),
-    ]])
-    await message.answer_photo(
-        BufferedInputFile(qr_bytes, filename="deposit_qr.png"),
-        caption=caption, reply_markup=back_kb, parse_mode=ParseMode.HTML,
+    await query.answer()
+
+
+@router.callback_query(F.data.startswith("oxapay_") & ~F.data.in_(["oxapay_menu", "oxapay_custom"]))
+async def cb_oxapay_amount(query: CallbackQuery) -> None:
+    """Process OxaPay payment for preset amounts."""
+    try:
+        amount = int(query.data.split("_")[1])
+    except (ValueError, IndexError):
+        await query.answer("❌ Invalid amount.", show_alert=True)
+        return
+    
+    await _create_oxapay_payment(query, amount)
+
+
+@router.callback_query(F.data == "oxapay_custom")
+async def cb_oxapay_custom(query: CallbackQuery, state: FSMContext) -> None:
+    """Prompt user for custom deposit amount."""
+    await state.set_state(OxaPayCustomAmount.amount)
+    await query.message.edit_text(
+        "✏️ <b>Custom Deposit Amount</b>\n\n"
+        "Enter the amount in USD (minimum $1):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔴 Cancel", callback_data="oxapay_cancel"),
+        ]]),
+        parse_mode=ParseMode.HTML,
     )
+    await query.answer()
+
+
+@router.callback_query(F.data == "oxapay_cancel")
+async def cb_oxapay_cancel(query: CallbackQuery, state: FSMContext) -> None:
+    """Cancel OxaPay custom amount input."""
+    await state.clear()
+    await cb_oxapay_menu(query)
+
+
+@router.message(OxaPayCustomAmount.amount)
+async def fsm_oxapay_custom_amount(message: Message, state: FSMContext) -> None:
+    """Process custom deposit amount input."""
+    await state.clear()
+    
+    try:
+        amount = Decimal(message.text.strip().replace("$", "").replace(",", ""))
+        if amount < 1:
+            await message.answer(
+                "❌ Minimum deposit amount is $1.\n\nPlease try again:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="💎 Try Again", callback_data="oxapay_custom"),
+                    InlineKeyboardButton(text="◀️ Back", callback_data="deposit"),
+                ]]),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if amount > 10000:
+            await message.answer(
+                "❌ Maximum deposit amount is $10,000.\n\nPlease try again:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="💎 Try Again", callback_data="oxapay_custom"),
+                    InlineKeyboardButton(text="◀️ Back", callback_data="deposit"),
+                ]]),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+    except (ValueError, InvalidOperation):
+        await message.answer(
+            "❌ Invalid amount. Please enter a valid number like 25 or 50.5",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="💎 Try Again", callback_data="oxapay_custom"),
+                InlineKeyboardButton(text="◀️ Back", callback_data="deposit"),
+            ]]),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    
+    # Calculate bonus
+    bonus_percent = 0
+    for threshold, bonus in sorted(DEPOSIT_BONUSES.items(), reverse=True):
+        if amount >= threshold:
+            bonus_percent = bonus
+            break
+    
+    bonus_amount = (amount * Decimal(bonus_percent) / Decimal(100)) if bonus_percent > 0 else Decimal(0)
+    
+    await _create_oxapay_payment_from_message(message, float(amount), float(bonus_amount))
+
+
+async def _create_oxapay_payment(query: CallbackQuery, amount: int) -> None:
+    """Create OxaPay payment invoice for preset amounts."""
+    user_id = query.from_user.id
+    
+    # Calculate bonus
+    bonus_percent = DEPOSIT_BONUSES.get(amount, 0)
+    bonus_amount = Decimal(amount) * Decimal(bonus_percent) / Decimal(100)
+    
+    # Generate unique track ID
+    track_id = f"dep_{user_id}_{uuid.uuid4().hex[:8]}"
+    
+    # Create payment request to OxaPay
+    try:
+        async with aiohttp.ClientSession() as http_session:
+            payload = {
+                "merchant": OXAPAY_API_KEY,
+                "amount": amount,
+                "currency": "USD",
+                "lifeTime": 60,  # 60 minutes
+                "callbackUrl": f"https://{OXAPAY_CALLBACK_DOMAIN}/oxapay/callback",
+                "returnUrl": f"https://{OXAPAY_CALLBACK_DOMAIN}/success",
+                "description": f"Deposit ${amount} USDT",
+                "orderId": track_id,
+            }
+            
+            async with http_session.post(OXAPAY_API_URL, json=payload) as resp:
+                if resp.status != 200:
+                    log.error("OxaPay API error: status %d", resp.status)
+                    await query.message.edit_text(
+                        "❌ Payment system temporarily unavailable.\n\nPlease try again later.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                            InlineKeyboardButton(text="🔄 Retry", callback_data="oxapay_menu"),
+                            InlineKeyboardButton(text="◀️ Back", callback_data="back_main"),
+                        ]]),
+                        parse_mode=ParseMode.HTML,
+                    )
+                    await query.answer()
+                    return
+                
+                data = await resp.json()
+                
+                if data.get("result") != 100:
+                    log.error("OxaPay error: %s", data)
+                    await query.message.edit_text(
+                        f"❌ Payment creation failed.\n\nError: {data.get('message', 'Unknown error')}",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                            InlineKeyboardButton(text="🔄 Retry", callback_data="oxapay_menu"),
+                            InlineKeyboardButton(text="◀️ Back", callback_data="back_main"),
+                        ]]),
+                        parse_mode=ParseMode.HTML,
+                    )
+                    await query.answer()
+                    return
+                
+                pay_link = data.get("payLink")
+                oxapay_track_id = data.get("trackId")
+                
+    except Exception as exc:
+        log.error("OxaPay request error: %s", exc)
+        await query.message.edit_text(
+            "❌ Connection error. Please try again.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🔄 Retry", callback_data="oxapay_menu"),
+                InlineKeyboardButton(text="◀️ Back", callback_data="back_main"),
+            ]]),
+            parse_mode=ParseMode.HTML,
+        )
+        await query.answer()
+        return
+    
+    # Store payment in database
+    async with AsyncSessionFactory() as session:
+        payment = OxaPayPayment(
+            user_id=user_id,
+            track_id=oxapay_track_id or track_id,
+            amount=Decimal(amount),
+            bonus_amount=bonus_amount,
+            status="Waiting",
+            pay_link=pay_link,
+        )
+        session.add(payment)
+        await session.commit()
+    
+    # Show payment link to user
+    bonus_text = f"\n🎁 <b>Bonus:</b> +${bonus_amount:.2f} ({bonus_percent}%)" if bonus_percent > 0 else ""
+    
+    await query.message.edit_text(
+        f"💎 <b>OxaPay Payment</b>\n\n"
+        f"💵 <b>Amount:</b> ${amount:.2f}{bonus_text}\n"
+        f"📝 <b>Order ID:</b> <code>{oxapay_track_id or track_id}</code>\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Click the button below to complete your payment.\n"
+        f"Your balance will be updated automatically!\n\n"
+        f"⏰ <i>Payment expires in 60 minutes</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Pay Now", url=pay_link)],
+            [InlineKeyboardButton(text="🔄 Check Status", callback_data=f"oxapay_check_{oxapay_track_id or track_id}")],
+            [InlineKeyboardButton(text="◀️ Cancel", callback_data="back_main")],
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
+    await query.answer()
+
+
+async def _create_oxapay_payment_from_message(message: Message, amount: float, bonus_amount: float) -> None:
+    """Create OxaPay payment from message (for custom amounts)."""
+    user_id = message.from_user.id
+    
+    # Calculate bonus percentage for display
+    bonus_percent = 0
+    for threshold, bonus in sorted(DEPOSIT_BONUSES.items(), reverse=True):
+        if amount >= threshold:
+            bonus_percent = bonus
+            break
+    
+    # Generate unique track ID  
+    track_id = f"dep_{user_id}_{uuid.uuid4().hex[:8]}"
+    
+    # Create payment request to OxaPay
+    try:
+        async with aiohttp.ClientSession() as http_session:
+            payload = {
+                "merchant": OXAPAY_API_KEY,
+                "amount": amount,
+                "currency": "USD",
+                "lifeTime": 60,
+                "callbackUrl": f"https://{OXAPAY_CALLBACK_DOMAIN}/oxapay/callback",
+                "returnUrl": f"https://{OXAPAY_CALLBACK_DOMAIN}/success",
+                "description": f"Deposit ${amount:.2f} USDT",
+                "orderId": track_id,
+            }
+            
+            async with http_session.post(OXAPAY_API_URL, json=payload) as resp:
+                if resp.status != 200:
+                    await message.answer(
+                        "❌ Payment system temporarily unavailable.\n\nPlease try again later.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                            InlineKeyboardButton(text="🔄 Retry", callback_data="oxapay_custom"),
+                            InlineKeyboardButton(text="◀️ Back", callback_data="back_main"),
+                        ]]),
+                        parse_mode=ParseMode.HTML,
+                    )
+                    return
+                
+                data = await resp.json()
+                
+                if data.get("result") != 100:
+                    await message.answer(
+                        f"❌ Payment creation failed.\n\nError: {data.get('message', 'Unknown error')}",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                            InlineKeyboardButton(text="🔄 Retry", callback_data="oxapay_custom"),
+                            InlineKeyboardButton(text="◀️ Back", callback_data="back_main"),
+                        ]]),
+                        parse_mode=ParseMode.HTML,
+                    )
+                    return
+                
+                pay_link = data.get("payLink")
+                oxapay_track_id = data.get("trackId")
+                
+    except Exception as exc:
+        log.error("OxaPay request error: %s", exc)
+        await message.answer(
+            "❌ Connection error. Please try again.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🔄 Retry", callback_data="oxapay_custom"),
+                InlineKeyboardButton(text="◀️ Back", callback_data="back_main"),
+            ]]),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    
+    # Store payment in database
+    async with AsyncSessionFactory() as session:
+        payment = OxaPayPayment(
+            user_id=user_id,
+            track_id=oxapay_track_id or track_id,
+            amount=Decimal(str(amount)),
+            bonus_amount=Decimal(str(bonus_amount)),
+            status="Waiting",
+            pay_link=pay_link,
+        )
+        session.add(payment)
+        await session.commit()
+    
+    # Show payment link to user
+    bonus_text = f"\n🎁 <b>Bonus:</b> +${bonus_amount:.2f} ({bonus_percent}%)" if bonus_percent > 0 else ""
+    
+    await message.answer(
+        f"💎 <b>OxaPay Payment</b>\n\n"
+        f"💵 <b>Amount:</b> ${amount:.2f}{bonus_text}\n"
+        f"📝 <b>Order ID:</b> <code>{oxapay_track_id or track_id}</code>\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Click the button below to complete your payment.\n"
+        f"Your balance will be updated automatically!\n\n"
+        f"⏰ <i>Payment expires in 60 minutes</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Pay Now", url=pay_link)],
+            [InlineKeyboardButton(text="🔄 Check Status", callback_data=f"oxapay_check_{oxapay_track_id or track_id}")],
+            [InlineKeyboardButton(text="◀️ Cancel", callback_data="back_main")],
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.callback_query(F.data.startswith("oxapay_check_"))
+async def cb_oxapay_check(query: CallbackQuery) -> None:
+    """Check OxaPay payment status."""
+    track_id = query.data.replace("oxapay_check_", "")
+    
+    async with AsyncSessionFactory() as session:
+        result = await session.execute(
+            select(OxaPayPayment).where(OxaPayPayment.track_id == track_id)
+        )
+        payment = result.scalar_one_or_none()
+        
+        if payment is None:
+            await query.answer("❌ Payment not found.", show_alert=True)
+            return
+        
+        if payment.status == "Confirmed":
+            await query.answer("✅ Payment already confirmed!", show_alert=True)
+            return
+    
+    # Check with OxaPay API
+    try:
+        async with aiohttp.ClientSession() as http_session:
+            payload = {
+                "merchant": OXAPAY_API_KEY,
+                "trackId": track_id,
+            }
+            
+            async with http_session.post(OXAPAY_INQUIRY_URL, json=payload) as resp:
+                if resp.status != 200:
+                    await query.answer("⏳ Checking... Please wait.", show_alert=True)
+                    return
+                
+                data = await resp.json()
+                status = data.get("status", "").lower()
+                
+                if status in ["paid", "confirmed"]:
+                    # Payment confirmed! Credit user
+                    await _process_oxapay_confirmation(payment, data)
+                    await query.answer("✅ Payment confirmed! Balance updated.", show_alert=True)
+                    
+                    # Update message
+                    await query.message.edit_text(
+                        f"✅ <b>Payment Confirmed!</b>\n\n"
+                        f"💵 <b>Amount:</b> ${payment.amount:.2f}\n"
+                        f"🎁 <b>Bonus:</b> +${payment.bonus_amount:.2f}\n"
+                        f"📝 <b>Order ID:</b> <code>{track_id}</code>\n\n"
+                        f"Your balance has been updated!",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                            InlineKeyboardButton(text="◀️ Back to Menu", callback_data="back_main"),
+                        ]]),
+                        parse_mode=ParseMode.HTML,
+                    )
+                elif status == "expired":
+                    await query.answer("❌ Payment expired. Please create a new one.", show_alert=True)
+                    async with AsyncSessionFactory() as session:
+                        await session.execute(
+                            update(OxaPayPayment)
+                            .where(OxaPayPayment.track_id == track_id)
+                            .values(status="Expired", updated_at=datetime.now(timezone.utc))
+                        )
+                        await session.commit()
+                else:
+                    await query.answer(f"⏳ Payment status: {status}. Please complete payment.", show_alert=True)
+                    
+    except Exception as exc:
+        log.error("OxaPay inquiry error: %s", exc)
+        await query.answer("⏳ Checking... Please wait and try again.", show_alert=True)
+
+
+async def _process_oxapay_confirmation(payment: OxaPayPayment, data: dict) -> None:
+    """Process confirmed OxaPay payment and credit user."""
+    async with AsyncSessionFactory() as session:
+        # Update payment status
+        await session.execute(
+            update(OxaPayPayment)
+            .where(OxaPayPayment.id == payment.id)
+            .values(status="Confirmed", updated_at=datetime.now(timezone.utc))
+        )
+        
+        # Credit user balance
+        total_credit = Decimal(str(payment.amount)) + Decimal(str(payment.bonus_amount))
+        await session.execute(
+            update(User)
+            .where(User.id == payment.user_id)
+            .values(
+                balance=User.balance + total_credit,
+                total_deposited=User.total_deposited + Decimal(str(payment.amount)),
+                total_bonus_received=User.total_bonus_received + Decimal(str(payment.bonus_amount)),
+            )
+        )
+        
+        # Record transaction
+        txn = Transaction(
+            user_id=payment.user_id,
+            type="OxaPayDeposit",
+            amount=payment.amount,
+            bonus=payment.bonus_amount,
+            tx_hash=payment.track_id,
+            status="Completed",
+        )
+        session.add(txn)
+        
+        # Handle referral commission
+        user_result = await session.execute(
+            select(User).where(User.id == payment.user_id)
+        )
+        user = user_result.scalar_one_or_none()
+        
+        if user and user.referred_by:
+            commission = (
+                Decimal(str(payment.amount))
+                * Decimal(str(REFERRAL_COMMISSION_PCT))
+                / Decimal(100)
+            )
+            await session.execute(
+                update(User)
+                .where(User.id == user.referred_by)
+                .values(balance=User.balance + commission)
+            )
+            ref_txn = Transaction(
+                user_id=user.referred_by,
+                type="ReferralBonus",
+                amount=commission,
+                tx_hash=payment.track_id,
+                status="Completed",
+            )
+            session.add(ref_txn)
+        
+        await session.commit()
 
 
 # ── Buy flow ──────────────────────────────────────────────────────────────────
@@ -889,15 +1513,330 @@ MAX_DISPLAY_ITEMS = 20
 
 @router.message(Command("buy"))
 async def cmd_buy(message: Message) -> None:
-    await _show_countries(message, page=0)
+    """Show main buy menu with categories."""
+    await message.answer(
+        "🛍️ <b>Buy Accounts</b>\n\n"
+        "Select a category to browse:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📱 Telegram Accounts", callback_data="buy_cat_telegram")],
+            [InlineKeyboardButton(text="🔐 Telegram Sessions", callback_data=f"buy_cat_{CATEGORY_TELEGRAM_SESSIONS}")],
+            [InlineKeyboardButton(text="💬 WhatsApp SMS", callback_data=f"buy_cat_{CATEGORY_WHATSAPP_SMS}")],
+            [InlineKeyboardButton(text="🔴 Back", callback_data="back_main")],
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @router.callback_query(F.data == "buy")
 async def cb_buy(query: CallbackQuery) -> None:
-    await _show_countries(query.message, page=0, edit=True)
+    """Show main buy menu with categories."""
+    await query.message.edit_text(
+        "🛍️ <b>Buy Accounts</b>\n\n"
+        "Select a category to browse:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📱 Telegram Accounts", callback_data="buy_cat_telegram")],
+            [InlineKeyboardButton(text="🔐 Telegram Sessions", callback_data=f"buy_cat_{CATEGORY_TELEGRAM_SESSIONS}")],
+            [InlineKeyboardButton(text="💬 WhatsApp SMS", callback_data=f"buy_cat_{CATEGORY_WHATSAPP_SMS}")],
+            [InlineKeyboardButton(text="🔴 Back", callback_data="back_main")],
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
     await query.answer()
 
 
+@router.callback_query(F.data == "buy_cat_telegram")
+async def cb_buy_cat_telegram(query: CallbackQuery) -> None:
+    """Show Telegram account subcategories."""
+    await query.message.edit_text(
+        "📱 <b>Telegram Accounts</b>\n\n"
+        "Choose account type:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📱 Telegram Accounts", callback_data=f"buy_cat_{CATEGORY_TELEGRAM_ACCOUNTS}")],
+            [InlineKeyboardButton(text="📱 Telegram Old Accounts", callback_data=f"buy_cat_{CATEGORY_TELEGRAM_OLD}")],
+            [InlineKeyboardButton(text="🔴 Back", callback_data="buy")],
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
+    await query.answer()
+
+
+@router.callback_query(F.data.startswith("buy_cat_"))
+async def cb_buy_category(query: CallbackQuery) -> None:
+    """Show countries for selected category."""
+    category = query.data.replace("buy_cat_", "")
+    
+    if category == "telegram":
+        # This is handled separately above
+        return
+    
+    await _show_category_countries(query.message, category, page=0, edit=True)
+    await query.answer()
+
+
+@router.callback_query(F.data.startswith("cat_countries_"))
+async def cb_cat_countries_page(query: CallbackQuery) -> None:
+    """Handle pagination for category countries."""
+    # Format: cat_countries_{category}_{page}
+    parts = query.data.replace("cat_countries_", "").rsplit("_", 1)
+    if len(parts) != 2:
+        await query.answer("Invalid request", show_alert=True)
+        return
+    
+    category, page_str = parts
+    try:
+        page = int(page_str)
+    except ValueError:
+        page = 0
+    
+    await _show_category_countries(query.message, category, page=page, edit=True)
+    await query.answer()
+
+
+async def _show_category_countries(
+    message: Message, category: str, page: int = 0, edit: bool = False
+) -> None:
+    """Show available countries for a specific category with availability counts."""
+    category_name = PRODUCT_CATEGORIES.get(category, "Unknown Category")
+    
+    async with AsyncSessionFactory() as session:
+        # Get distinct countries with available count for this category
+        from sqlalchemy import func
+        rows = await session.execute(
+            select(Product.country, func.count(Product.id).label("count"))
+            .where(Product.status == "Available", Product.category == category)
+            .group_by(Product.country)
+            .order_by(Product.country)
+        )
+        countries_data = rows.fetchall()
+
+    if not countries_data:
+        text = f"😔 No {category_name} available right now.\n\nCheck back later!"
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="◀️ Back", callback_data="buy"),
+        ]])
+        if edit:
+            await message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        else:
+            await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        return
+
+    total_pages = (len(countries_data) + PAGE_SIZE - 1) // PAGE_SIZE
+    page_data = countries_data[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+
+    buttons = [
+        [InlineKeyboardButton(
+            text=f"{get_country_flag(country)} {country.title()} ({count})",
+            callback_data=f"cat_country_{category}_{country}",
+        )]
+        for country, count in page_data
+    ]
+    
+    nav_row: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav_row.append(
+            InlineKeyboardButton(text="⬅️ Prev", callback_data=f"cat_countries_{category}_{page - 1}")
+        )
+    if page < total_pages - 1:
+        nav_row.append(
+            InlineKeyboardButton(text="Next ➡️", callback_data=f"cat_countries_{category}_{page + 1}")
+        )
+    if nav_row:
+        buttons.append(nav_row)
+    
+    # Back button based on category
+    if category in [CATEGORY_TELEGRAM_ACCOUNTS, CATEGORY_TELEGRAM_OLD]:
+        buttons.append([InlineKeyboardButton(text="🔴 Back", callback_data="buy_cat_telegram")])
+    else:
+        buttons.append([InlineKeyboardButton(text="🔴 Back", callback_data="buy")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    text = (
+        f"{category_name}\n\n"
+        f"🌍 <b>Select a Country</b> (Page {page + 1}/{total_pages}):\n"
+        f"<i>Number in brackets = Available count</i>"
+    )
+    if edit:
+        await message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    else:
+        await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data.startswith("cat_country_"))
+async def cb_cat_country(query: CallbackQuery) -> None:
+    """Show country availability info and buy button."""
+    # Format: cat_country_{category}_{country}
+    parts = query.data.replace("cat_country_", "").split("_", 1)
+    if len(parts) != 2:
+        await query.answer("Invalid request", show_alert=True)
+        return
+    
+    category, country = parts
+    category_name = PRODUCT_CATEGORIES.get(category, "Unknown")
+    
+    async with AsyncSessionFactory() as session:
+        # Get available count and price for this country/category
+        rows = await session.execute(
+            select(Product)
+            .where(
+                Product.country == country,
+                Product.category == category,
+                Product.status == "Available"
+            )
+            .order_by(Product.price)
+        )
+        products = rows.scalars().all()
+    
+    if not products:
+        await query.answer("❌ No numbers available for this country.", show_alert=True)
+        return
+    
+    available_count = len(products)
+    price = products[0].price  # All should have same price per country
+    
+    await query.message.edit_text(
+        f"🌍 <b>{get_country_flag(country)} {country.title()}</b>\n"
+        f"📁 <b>Category:</b> {category_name}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📱 <b>Available Numbers:</b> {available_count}\n"
+        f"💰 <b>Price per Number:</b> ${price:.2f} USDT\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Click <b>Buy Now</b> to purchase a random number from this pool.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Buy Now", callback_data=f"buy_now_{category}_{country}")],
+            [InlineKeyboardButton(text="🔴 Cancel", callback_data=f"buy_cat_{category}")],
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
+    await query.answer()
+
+
+@router.callback_query(F.data.startswith("buy_now_"))
+async def cb_buy_now(query: CallbackQuery) -> None:
+    """Process purchase - randomly assign a number from the pool."""
+    # Format: buy_now_{category}_{country}
+    parts = query.data.replace("buy_now_", "").split("_", 1)
+    if len(parts) != 2:
+        await query.answer("Invalid request", show_alert=True)
+        return
+    
+    category, country = parts
+    user_id = query.from_user.id
+    
+    async with AsyncSessionFactory() as session:
+        # Get user
+        user = await get_or_create_user(
+            session, user_id, query.from_user.username,
+            first_name=query.from_user.first_name,
+        )
+        
+        if user.is_banned:
+            await query.answer("🚫 You are banned from using this bot.", show_alert=True)
+            return
+        
+        # Get available products for this category/country
+        rows = await session.execute(
+            select(Product)
+            .where(
+                Product.country == country,
+                Product.category == category,
+                Product.status == "Available"
+            )
+        )
+        available_products = rows.scalars().all()
+        
+        if not available_products:
+            await query.answer("❌ No numbers available. Please try another country.", show_alert=True)
+            return
+        
+        # Securely randomly select one product
+        product = secrets.choice(available_products)
+        
+        # Check balance
+        if Decimal(str(user.balance)) < Decimal(str(product.price)):
+            await query.message.edit_text(
+                f"❌ <b>Insufficient Balance</b>\n\n"
+                f"💰 Your balance: <b>${user.balance:.2f}</b>\n"
+                f"💵 Required: <b>${product.price:.2f}</b>\n\n"
+                f"Please deposit funds first.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📥 Deposit", callback_data="deposit")],
+                    [InlineKeyboardButton(text="◀️ Back", callback_data=f"cat_country_{category}_{country}")],
+                ]),
+                parse_mode=ParseMode.HTML,
+            )
+            await query.answer()
+            return
+        
+        # Process purchase
+        new_balance = Decimal(str(user.balance)) - Decimal(str(product.price))
+        await session.execute(
+            update(User)
+            .where(User.id == user_id)
+            .values(
+                balance=new_balance,
+                numbers_bought=User.numbers_bought + 1
+            )
+        )
+        await session.execute(
+            update(Product)
+            .where(Product.id == product.id)
+            .values(status="Sold")
+        )
+        
+        order = Order(user_id=user_id, product_id=product.id, status="Completed")
+        session.add(order)
+        await session.flush()
+        
+        txn = Transaction(
+            user_id=user_id,
+            order_id=order.id,
+            type="Purchase",
+            amount=product.price,
+            status="Completed",
+        )
+        session.add(txn)
+        await session.commit()
+        
+        phone = product.phone_number
+        price = product.price
+        sess_str = product.session_string
+        pid = product.id
+
+    # Clear any stale OTP from previous ownership
+    async with AsyncSessionFactory() as session:
+        await session.execute(
+            update(Product)
+            .where(Product.id == pid)
+            .values(latest_otp=None, otp_updated_at=None)
+        )
+        await session.commit()
+
+    # Start the background OTP listener via the manager
+    if sess_str:
+        await otp_manager.start_listener(pid, sess_str)
+
+    await query.message.edit_text(
+        f"🎉 <b>Purchase Successful!</b>\n\n"
+        f"📱 <b>Number:</b> <code>{phone}</code>\n"
+        f"🌍 <b>Country:</b> {get_country_flag(country)} {country.title()}\n"
+        f"💵 <b>Paid:</b> ${price:.2f} USDT\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📋 <b>Next Steps:</b>\n"
+        f"1️⃣ Open <b>Telegram / Telegram X / TurboTel</b>\n"
+        f"2️⃣ Enter the number: <code>{phone}</code>\n"
+        f"3️⃣ Tap <b>Send Code</b> in Telegram\n"
+        f"4️⃣ Come back here and press <b>🔄 Get OTP</b>\n\n"
+        f"⚡ OTP is fetched <b>instantly</b> from the account!",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Get OTP", callback_data=f"getotp_{pid}")],
+            [InlineKeyboardButton(text="◀️ Main Menu", callback_data="back_main")],
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
+    await query.answer()
+
+
+# Legacy buy flow compatibility (for direct country selection without category)
 @router.callback_query(F.data.startswith("countries_page_"))
 async def cb_countries_page(query: CallbackQuery) -> None:
     page = int(query.data.split("_")[-1])
@@ -1189,13 +2128,25 @@ async def _safe_edit(
 
 @router.callback_query(F.data == "back_main")
 async def cb_back_main(query: CallbackQuery) -> None:
+    async with AsyncSessionFactory() as session:
+        user = await get_or_create_user(
+            session,
+            query.from_user.id,
+            query.from_user.username,
+            first_name=query.from_user.first_name or "User",
+        )
+        balance = Decimal(str(user.balance or 0))
+        first_name = user.first_name or query.from_user.first_name or "User"
+    
     is_admin = query.from_user.id in ADMIN_IDS
     kb = build_main_keyboard(is_admin)
+    welcome_text = get_welcome_text(first_name, balance)
+    
     if query.message.photo or query.message.video or query.message.document:
         await query.message.delete()
-        await query.message.answer(WELCOME_TEXT, reply_markup=kb, parse_mode=ParseMode.HTML)
+        await query.message.answer(welcome_text, reply_markup=kb, parse_mode=ParseMode.HTML)
     else:
-        await query.message.edit_text(WELCOME_TEXT, reply_markup=kb, parse_mode=ParseMode.HTML)
+        await query.message.edit_text(welcome_text, reply_markup=kb, parse_mode=ParseMode.HTML)
     await query.answer()
 
 
@@ -1296,9 +2247,36 @@ async def cb_admin_menu(query: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "admin_add_number")
 @admin_only
 async def cb_admin_add_number(query: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(AdminAddNumber.country)
+    """Start add number flow - first select category."""
     await query.message.edit_text(
-        "➕ <b>Add New Number</b>\n\nStep 1/4: Enter the <b>country name</b>:",
+        "➕ <b>Add New Number</b>\n\n"
+        "Step 1/5: Select the <b>category</b>:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📱 Telegram Accounts", callback_data=f"admin_add_cat_{CATEGORY_TELEGRAM_ACCOUNTS}")],
+            [InlineKeyboardButton(text="📱 Telegram Old Accounts", callback_data=f"admin_add_cat_{CATEGORY_TELEGRAM_OLD}")],
+            [InlineKeyboardButton(text="🔐 Telegram Sessions", callback_data=f"admin_add_cat_{CATEGORY_TELEGRAM_SESSIONS}")],
+            [InlineKeyboardButton(text="💬 WhatsApp SMS", callback_data=f"admin_add_cat_{CATEGORY_WHATSAPP_SMS}")],
+            [InlineKeyboardButton(text="❌ Cancel", callback_data="admin_menu")],
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
+    await query.answer()
+
+
+@router.callback_query(F.data.startswith("admin_add_cat_"))
+@admin_only
+async def cb_admin_add_category(query: CallbackQuery, state: FSMContext) -> None:
+    """Category selected, now ask for country."""
+    category = query.data.replace("admin_add_cat_", "")
+    category_name = PRODUCT_CATEGORIES.get(category, "Unknown")
+    
+    await state.update_data(category=category)
+    await state.set_state(AdminAddNumber.country)
+    
+    await query.message.edit_text(
+        f"➕ <b>Add New Number</b>\n\n"
+        f"📁 Category: <b>{category_name}</b>\n\n"
+        f"Step 2/5: Enter the <b>country name</b>:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="❌ Cancel", callback_data="admin_cancel_add"),
         ]]),
@@ -1310,10 +2288,10 @@ async def cb_admin_add_number(query: CallbackQuery, state: FSMContext) -> None:
 @router.message(AdminAddNumber.country)
 @admin_only
 async def fsm_add_country(message: Message, state: FSMContext) -> None:
-    await state.update_data(country=message.text.strip())
+    await state.update_data(country=message.text.strip().lower())
     await state.set_state(AdminAddNumber.phone)
     await message.answer(
-        "Step 2/4: Enter the <b>phone number</b> (e.g. +1 5550001234):",
+        "Step 3/5: Enter the <b>phone number</b> (e.g. +91 9876543210):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="❌ Cancel", callback_data="admin_cancel_add"),
         ]]),
@@ -1327,7 +2305,7 @@ async def fsm_add_phone(message: Message, state: FSMContext) -> None:
     await state.update_data(phone=message.text.strip())
     await state.set_state(AdminAddNumber.price)
     await message.answer(
-        "Step 3/4: Enter the <b>price in USDT</b> (e.g. 5.00):",
+        "Step 4/5: Enter the <b>price in USDT</b> (e.g. 5.00):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="❌ Cancel", callback_data="admin_cancel_add"),
         ]]),
@@ -1348,7 +2326,7 @@ async def fsm_add_price(message: Message, state: FSMContext) -> None:
     await state.update_data(price=str(price))
     await state.set_state(AdminAddNumber.session_string)
     await message.answer(
-        "Step 4/4: Paste the <b>Pyrogram Session String</b> for this number\n"
+        "Step 5/5: Paste the <b>Pyrogram Session String</b> for this number\n"
         "(generate it with <code>generate_session.py</code>):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="❌ Cancel", callback_data="admin_cancel_add"),
@@ -1362,8 +2340,12 @@ async def fsm_add_price(message: Message, state: FSMContext) -> None:
 async def fsm_add_session_string(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     session_str = message.text.strip()
+    category = data.get("category", CATEGORY_TELEGRAM_ACCOUNTS)
+    category_name = PRODUCT_CATEGORIES.get(category, "Unknown")
+    
     async with AsyncSessionFactory() as session:
         product = Product(
+            category=category,
             country=data["country"],
             phone_number=data["phone"],
             price=Decimal(data["price"]),
@@ -1375,8 +2357,12 @@ async def fsm_add_session_string(message: Message, state: FSMContext) -> None:
 
     await state.clear()
     await message.answer(
-        f"✅ Number <b>{data['phone']}</b> ({data['country']}) added at "
-        f"<b>${data['price']} USDT</b> with session string.",
+        f"✅ <b>Number Added Successfully!</b>\n\n"
+        f"📁 Category: <b>{category_name}</b>\n"
+        f"📱 Number: <b>{data['phone']}</b>\n"
+        f"🌍 Country: <b>{get_country_flag(data['country'])} {data['country'].title()}</b>\n"
+        f"💰 Price: <b>${data['price']} USDT</b>\n"
+        f"🔐 Session: ✅ Configured",
         reply_markup=build_admin_keyboard(),
         parse_mode=ParseMode.HTML,
     )
@@ -2507,6 +3493,91 @@ async def _check_deposits(bot: Bot) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  OXAPAY PAYMENT MONITOR (background task)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def oxapay_payment_monitor(bot: Bot) -> None:
+    """Background task to check pending OxaPay payments."""
+    log.info("OxaPay payment monitor started.")
+    while True:
+        try:
+            await _check_pending_oxapay_payments(bot)
+        except Exception as exc:
+            log.error("OxaPay monitor error: %s", exc, exc_info=True)
+        await asyncio.sleep(OXAPAY_POLL_INTERVAL)
+
+
+async def _check_pending_oxapay_payments(bot: Bot) -> None:
+    """Check all pending OxaPay payments and process confirmations."""
+    async with AsyncSessionFactory() as session:
+        # Get all pending payments
+        rows = await session.execute(
+            select(OxaPayPayment).where(
+                OxaPayPayment.status.in_(["Waiting", "Confirming"])
+            )
+        )
+        pending_payments = rows.scalars().all()
+    
+    if not pending_payments:
+        return
+    
+    for payment in pending_payments:
+        try:
+            async with aiohttp.ClientSession() as http_session:
+                payload = {
+                    "merchant": OXAPAY_API_KEY,
+                    "trackId": payment.track_id,
+                }
+                
+                async with http_session.post(OXAPAY_INQUIRY_URL, json=payload) as resp:
+                    if resp.status != 200:
+                        continue
+                    
+                    data = await resp.json()
+                    status = data.get("status", "").lower()
+                    
+                    if status in ["paid", "confirmed"]:
+                        # Payment confirmed! Credit user
+                        await _process_oxapay_confirmation(payment, data)
+                        
+                        # Notify user
+                        try:
+                            total_credit = Decimal(str(payment.amount)) + Decimal(str(payment.bonus_amount))
+                            await bot.send_message(
+                                payment.user_id,
+                                f"✅ <b>Payment Confirmed!</b>\n\n"
+                                f"💵 Amount: <b>${payment.amount:.2f}</b>\n"
+                                f"🎁 Bonus: <b>+${payment.bonus_amount:.2f}</b>\n"
+                                f"💰 Total Credited: <b>${total_credit:.2f} USDT</b>\n\n"
+                                f"Your balance has been updated!",
+                                parse_mode=ParseMode.HTML,
+                            )
+                        except Exception as exc:
+                            log.warning("Could not notify user %s: %s", payment.user_id, exc)
+                    
+                    elif status == "expired":
+                        async with AsyncSessionFactory() as session:
+                            await session.execute(
+                                update(OxaPayPayment)
+                                .where(OxaPayPayment.id == payment.id)
+                                .values(status="Expired", updated_at=datetime.now(timezone.utc))
+                            )
+                            await session.commit()
+                    
+                    elif status == "confirming":
+                        async with AsyncSessionFactory() as session:
+                            await session.execute(
+                                update(OxaPayPayment)
+                                .where(OxaPayPayment.id == payment.id)
+                                .values(status="Confirming", updated_at=datetime.now(timezone.utc))
+                            )
+                            await session.commit()
+                            
+        except Exception as exc:
+            log.warning("Error checking OxaPay payment %s: %s", payment.track_id, exc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  MAIN ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2524,6 +3595,9 @@ async def main() -> None:
 
     # Start blockchain monitor as a background task
     asyncio.create_task(blockchain_monitor(bot))
+    
+    # Start OxaPay payment monitor as a background task
+    asyncio.create_task(oxapay_payment_monitor(bot))
 
     # Save blockchain state on graceful shutdown (SIGINT / SIGTERM)
     loop = asyncio.get_event_loop()
