@@ -223,7 +223,7 @@ except ImportError:
 #  DATABASE MODELS
 # ─────────────────────────────────────────────────────────────────────────────
 
-engine = create_async_engine(DATABASE_URL, echo=False)
+engine = create_async_engine(DATABASE_URL, echo=False, pool_size=10, max_overflow=20, pool_pre_ping=True)
 AsyncSessionFactory = async_sessionmaker(engine, expire_on_commit=False)
 
 
@@ -350,6 +350,21 @@ def make_qr_bytes(data: str) -> bytes:
     return buf.getvalue()
 
 
+def apply_button_style(button: InlineKeyboardButton, style: str) -> InlineKeyboardButton:
+    """Apply color style to an InlineKeyboardButton for Telegram Bot API 9.4+.
+    style: 'primary' (blue), 'success' (green), 'danger' (red)
+    Since aiogram's TelegramObject has extra='allow', extra fields are preserved.
+    """
+    data = button.model_dump(exclude_none=True)
+    data['style'] = style
+    return InlineKeyboardButton(**data)
+
+
+def create_styled_keyboard(keyboard_array) -> InlineKeyboardMarkup:
+    """Create InlineKeyboardMarkup from a 2D array supporting styled buttons."""
+    return InlineKeyboardMarkup(inline_keyboard=keyboard_array)
+
+
 def get_country_flag(country: str) -> str:
     return COUNTRY_FLAGS.get(country.lower().strip(), "🌍")
 
@@ -431,38 +446,21 @@ async def get_or_create_user(
 
 
 def build_main_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
-    """Build the main menu with styled inline buttons.
-    
-    Note: Telegram Bot API 7.3+ (Feb 2024) introduced button styling parameters.
-    Currently using emoji-based visual styling for compatibility.
-    """
+    """Build the main menu with styled inline buttons."""
     buttons = [
-        # Row 1: Buy Accounts (wider)
+        [apply_button_style(InlineKeyboardButton(text="🛍️ Buy Accounts", callback_data="buy"), 'primary')],
         [
-            InlineKeyboardButton(text="🛍️ Buy Accounts", callback_data="buy"),
+            apply_button_style(InlineKeyboardButton(text="📥 Deposit", callback_data="deposit"), 'success'),
+            apply_button_style(InlineKeyboardButton(text="👤 Profile", callback_data="profile"), 'primary'),
         ],
-        # Row 2: Deposit + Profile
         [
-            InlineKeyboardButton(text="📥 Deposit", callback_data="deposit"),
-            InlineKeyboardButton(text="👤 Profile", callback_data="profile"),
+            apply_button_style(InlineKeyboardButton(text="🤝 Referral", callback_data="referral"), 'primary'),
+            apply_button_style(InlineKeyboardButton(text="❓ Help", callback_data="help"), 'primary'),
         ],
-        # Row 3: Referral + Help
-        [
-            InlineKeyboardButton(text="🤝 Referral", callback_data="referral"),
-            InlineKeyboardButton(text="❓ Help", callback_data="help"),
-        ],
-        # Row 4: Support (redirect to telegram)
-        [
-            InlineKeyboardButton(
-                text="🆘 Support",
-                url=f"https://t.me/{SUPPORT_USERNAME}",
-            ),
-        ],
+        [apply_button_style(InlineKeyboardButton(text="🆘 Support", url=f"https://t.me/{SUPPORT_USERNAME}"), 'danger')],
     ]
     if is_admin:
-        buttons.append([
-            InlineKeyboardButton(text="🔐 Admin Panel", callback_data="admin_menu"),
-        ])
+        buttons.append([apply_button_style(InlineKeyboardButton(text="🔐 Admin Panel", callback_data="admin_menu"), 'primary')])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -953,6 +951,7 @@ async def cmd_menu(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "profile")
 async def cb_profile(query: CallbackQuery) -> None:
+    await query.answer()
     user_id = query.from_user.id
     async with AsyncSessionFactory() as session:
         user = await get_or_create_user(
@@ -960,25 +959,13 @@ async def cb_profile(query: CallbackQuery) -> None:
             first_name=query.from_user.first_name,
         )
         
-        # Get referral count
-        ref_result = await session.execute(
-            select(User).where(User.referred_by == user_id)
+        ref_result, ord_result, bonus_result = await asyncio.gather(
+            session.execute(select(User).where(User.referred_by == user_id)),
+            session.execute(select(Order).where(Order.user_id == user_id, Order.status == "Completed")),
+            session.execute(select(Transaction).where(Transaction.user_id == user_id, Transaction.type.in_(["ReferralBonus", "DepositBonus"]))),
         )
         referrals = ref_result.scalars().all()
-        
-        # Get purchase count
-        ord_result = await session.execute(
-            select(Order).where(Order.user_id == user_id, Order.status == "Completed")
-        )
         purchases = ord_result.scalars().all()
-        
-        # Get bonus transactions
-        bonus_result = await session.execute(
-            select(Transaction).where(
-                Transaction.user_id == user_id,
-                Transaction.type.in_(["ReferralBonus", "DepositBonus"]),
-            )
-        )
         bonuses = bonus_result.scalars().all()
         total_bonus = sum(Decimal(str(b.amount)) for b in bonuses)
 
@@ -1001,26 +988,25 @@ async def cb_profile(query: CallbackQuery) -> None:
         f"📅 <b>Joined:</b> {joined}\n"
         f"━━━━━━━━━━━━━━━━━━━━━",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📦 My Purchases", callback_data="my_purchases")],
-            [InlineKeyboardButton(text="◀️ Back", callback_data="back_main")],
+            [apply_button_style(InlineKeyboardButton(text="📦 My Purchases", callback_data="my_purchases"), 'primary')],
+            [apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="back_main"), 'danger')],
         ]),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 # ── Help ──────────────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data == "help")
 async def cb_help(query: CallbackQuery) -> None:
+    await query.answer()
     await query.message.edit_text(
         get_help_text(),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="◀️ Back", callback_data="back_main"),
+            apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="back_main"), 'danger'),
         ]]),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 # ── Deposit ───────────────────────────────────────────────────────────────────
@@ -1032,8 +1018,8 @@ async def cmd_deposit(message: Message) -> None:
         "💳 <b>Deposit Funds</b>\n\n"
         "Choose your preferred deposit method:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💎 OxaPay Crypto", callback_data="oxapay_menu")],
-            [InlineKeyboardButton(text="🔴 Cancel", callback_data="back_main")],
+            [apply_button_style(InlineKeyboardButton(text="💎 OxaPay Crypto", callback_data="oxapay_menu"), 'success')],
+            [apply_button_style(InlineKeyboardButton(text="🔴 Cancel", callback_data="back_main"), 'danger')],
         ]),
         parse_mode=ParseMode.HTML,
     )
@@ -1042,16 +1028,16 @@ async def cmd_deposit(message: Message) -> None:
 @router.callback_query(F.data == "deposit")
 async def cb_deposit(query: CallbackQuery) -> None:
     """Show deposit options menu."""
+    await query.answer()
     await query.message.edit_text(
         "💳 <b>Deposit Funds</b>\n\n"
         "Choose your preferred deposit method:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💎 OxaPay Crypto", callback_data="oxapay_menu")],
-            [InlineKeyboardButton(text="🔴 Back", callback_data="back_main")],
+            [apply_button_style(InlineKeyboardButton(text="💎 OxaPay Crypto", callback_data="oxapay_menu"), 'success')],
+            [apply_button_style(InlineKeyboardButton(text="🔴 Back", callback_data="back_main"), 'danger')],
         ]),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 # ── OxaPay Payment System ─────────────────────────────────────────────────────
@@ -1059,30 +1045,26 @@ async def cb_deposit(query: CallbackQuery) -> None:
 @router.callback_query(F.data == "oxapay_menu")
 async def cb_oxapay_menu(query: CallbackQuery) -> None:
     """Show OxaPay amount selection menu."""
+    await query.answer()
     await query.message.edit_text(
         "💎 <b>OxaPay Crypto Deposit</b>\n\n"
         "Select the amount to deposit:\n\n"
         "💡 <i>Bonus amounts are added to your balance after payment!</i>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            # Row 1: $1, $5, $10
             [
-                InlineKeyboardButton(text="💵 $1", callback_data="oxapay_1"),
-                InlineKeyboardButton(text="💵 $5", callback_data="oxapay_5"),
-                InlineKeyboardButton(text="💵 $10", callback_data="oxapay_10"),
+                apply_button_style(InlineKeyboardButton(text="💵 $1", callback_data="oxapay_1"), 'success'),
+                apply_button_style(InlineKeyboardButton(text="💵 $5", callback_data="oxapay_5"), 'success'),
+                apply_button_style(InlineKeyboardButton(text="💵 $10", callback_data="oxapay_10"), 'success'),
             ],
-            # Row 2: $20 (5% bonus), $50 (10% bonus)
             [
-                InlineKeyboardButton(text="💵 $20 (+5%)", callback_data="oxapay_20"),
-                InlineKeyboardButton(text="💵 $50 (+10%)", callback_data="oxapay_50"),
+                apply_button_style(InlineKeyboardButton(text="💵 $20 (+5%)", callback_data="oxapay_20"), 'success'),
+                apply_button_style(InlineKeyboardButton(text="💵 $50 (+10%)", callback_data="oxapay_50"), 'success'),
             ],
-            # Row 3: Custom amount
-            [InlineKeyboardButton(text="✏️ Custom Amount", callback_data="oxapay_custom")],
-            # Row 4: Cancel
-            [InlineKeyboardButton(text="🔴 Cancel", callback_data="back_main")],
+            [apply_button_style(InlineKeyboardButton(text="✏️ Custom Amount", callback_data="oxapay_custom"), 'primary')],
+            [apply_button_style(InlineKeyboardButton(text="🔴 Cancel", callback_data="back_main"), 'danger')],
         ]),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 @router.callback_query(F.data.startswith("oxapay_") & ~F.data.in_(["oxapay_menu", "oxapay_custom"]))
@@ -1100,16 +1082,16 @@ async def cb_oxapay_amount(query: CallbackQuery) -> None:
 @router.callback_query(F.data == "oxapay_custom")
 async def cb_oxapay_custom(query: CallbackQuery, state: FSMContext) -> None:
     """Prompt user for custom deposit amount."""
+    await query.answer()
     await state.set_state(OxaPayCustomAmount.amount)
     await query.message.edit_text(
         "✏️ <b>Custom Deposit Amount</b>\n\n"
         "Enter the amount in USD (minimum $1):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="🔴 Cancel", callback_data="oxapay_cancel"),
+            apply_button_style(InlineKeyboardButton(text="🔴 Cancel", callback_data="oxapay_cancel"), 'danger'),
         ]]),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 @router.callback_query(F.data == "oxapay_cancel")
@@ -1130,8 +1112,8 @@ async def fsm_oxapay_custom_amount(message: Message, state: FSMContext) -> None:
             await message.answer(
                 "❌ Minimum deposit amount is $1.\n\nPlease try again:",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="💎 Try Again", callback_data="oxapay_custom"),
-                    InlineKeyboardButton(text="◀️ Back", callback_data="deposit"),
+                    apply_button_style(InlineKeyboardButton(text="💎 Try Again", callback_data="oxapay_custom"), 'primary'),
+                    apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="deposit"), 'danger'),
                 ]]),
                 parse_mode=ParseMode.HTML,
             )
@@ -1140,8 +1122,8 @@ async def fsm_oxapay_custom_amount(message: Message, state: FSMContext) -> None:
             await message.answer(
                 "❌ Maximum deposit amount is $10,000.\n\nPlease try again:",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="💎 Try Again", callback_data="oxapay_custom"),
-                    InlineKeyboardButton(text="◀️ Back", callback_data="deposit"),
+                    apply_button_style(InlineKeyboardButton(text="💎 Try Again", callback_data="oxapay_custom"), 'primary'),
+                    apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="deposit"), 'danger'),
                 ]]),
                 parse_mode=ParseMode.HTML,
             )
@@ -1150,8 +1132,8 @@ async def fsm_oxapay_custom_amount(message: Message, state: FSMContext) -> None:
         await message.answer(
             "❌ Invalid amount. Please enter a valid number like 25 or 50.5",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="💎 Try Again", callback_data="oxapay_custom"),
-                InlineKeyboardButton(text="◀️ Back", callback_data="deposit"),
+                apply_button_style(InlineKeyboardButton(text="💎 Try Again", callback_data="oxapay_custom"), 'primary'),
+                apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="deposit"), 'danger'),
             ]]),
             parse_mode=ParseMode.HTML,
         )
@@ -1200,8 +1182,8 @@ async def _create_oxapay_payment(query: CallbackQuery, amount: int) -> None:
                     await query.message.edit_text(
                         "❌ Payment system temporarily unavailable.\n\nPlease try again later.",
                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                            InlineKeyboardButton(text="🔄 Retry", callback_data="oxapay_menu"),
-                            InlineKeyboardButton(text="◀️ Back", callback_data="back_main"),
+                            apply_button_style(InlineKeyboardButton(text="🔄 Retry", callback_data="oxapay_menu"), 'primary'),
+                            apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="back_main"), 'danger'),
                         ]]),
                         parse_mode=ParseMode.HTML,
                     )
@@ -1215,8 +1197,8 @@ async def _create_oxapay_payment(query: CallbackQuery, amount: int) -> None:
                     await query.message.edit_text(
                         f"❌ Payment creation failed.\n\nError: {data.get('message', 'Unknown error')}",
                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                            InlineKeyboardButton(text="🔄 Retry", callback_data="oxapay_menu"),
-                            InlineKeyboardButton(text="◀️ Back", callback_data="back_main"),
+                            apply_button_style(InlineKeyboardButton(text="🔄 Retry", callback_data="oxapay_menu"), 'primary'),
+                            apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="back_main"), 'danger'),
                         ]]),
                         parse_mode=ParseMode.HTML,
                     )
@@ -1231,8 +1213,8 @@ async def _create_oxapay_payment(query: CallbackQuery, amount: int) -> None:
         await query.message.edit_text(
             "❌ Connection error. Please try again.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="🔄 Retry", callback_data="oxapay_menu"),
-                InlineKeyboardButton(text="◀️ Back", callback_data="back_main"),
+                apply_button_style(InlineKeyboardButton(text="🔄 Retry", callback_data="oxapay_menu"), 'primary'),
+                apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="back_main"), 'danger'),
             ]]),
             parse_mode=ParseMode.HTML,
         )
@@ -1264,9 +1246,9 @@ async def _create_oxapay_payment(query: CallbackQuery, amount: int) -> None:
         f"Your balance will be updated automatically!\n\n"
         f"⏰ <i>Payment expires in 60 minutes</i>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Pay Now", url=pay_link)],
-            [InlineKeyboardButton(text="🔄 Check Status", callback_data=f"oxapay_check_{oxapay_track_id or track_id}")],
-            [InlineKeyboardButton(text="◀️ Cancel", callback_data="back_main")],
+            [apply_button_style(InlineKeyboardButton(text="💳 Pay Now", url=pay_link), 'success')],
+            [apply_button_style(InlineKeyboardButton(text="🔄 Check Status", callback_data=f"oxapay_check_{oxapay_track_id or track_id}"), 'primary')],
+            [apply_button_style(InlineKeyboardButton(text="◀️ Cancel", callback_data="back_main"), 'danger')],
         ]),
         parse_mode=ParseMode.HTML,
     )
@@ -1306,8 +1288,8 @@ async def _create_oxapay_payment_from_message(message: Message, amount: float, b
                     await message.answer(
                         "❌ Payment system temporarily unavailable.\n\nPlease try again later.",
                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                            InlineKeyboardButton(text="🔄 Retry", callback_data="oxapay_custom"),
-                            InlineKeyboardButton(text="◀️ Back", callback_data="back_main"),
+                            apply_button_style(InlineKeyboardButton(text="🔄 Retry", callback_data="oxapay_custom"), 'primary'),
+                            apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="back_main"), 'danger'),
                         ]]),
                         parse_mode=ParseMode.HTML,
                     )
@@ -1319,8 +1301,8 @@ async def _create_oxapay_payment_from_message(message: Message, amount: float, b
                     await message.answer(
                         f"❌ Payment creation failed.\n\nError: {data.get('message', 'Unknown error')}",
                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                            InlineKeyboardButton(text="🔄 Retry", callback_data="oxapay_custom"),
-                            InlineKeyboardButton(text="◀️ Back", callback_data="back_main"),
+                            apply_button_style(InlineKeyboardButton(text="🔄 Retry", callback_data="oxapay_custom"), 'primary'),
+                            apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="back_main"), 'danger'),
                         ]]),
                         parse_mode=ParseMode.HTML,
                     )
@@ -1334,8 +1316,8 @@ async def _create_oxapay_payment_from_message(message: Message, amount: float, b
         await message.answer(
             "❌ Connection error. Please try again.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="🔄 Retry", callback_data="oxapay_custom"),
-                InlineKeyboardButton(text="◀️ Back", callback_data="back_main"),
+                apply_button_style(InlineKeyboardButton(text="🔄 Retry", callback_data="oxapay_custom"), 'primary'),
+                apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="back_main"), 'danger'),
             ]]),
             parse_mode=ParseMode.HTML,
         )
@@ -1366,9 +1348,9 @@ async def _create_oxapay_payment_from_message(message: Message, amount: float, b
         f"Your balance will be updated automatically!\n\n"
         f"⏰ <i>Payment expires in 60 minutes</i>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Pay Now", url=pay_link)],
-            [InlineKeyboardButton(text="🔄 Check Status", callback_data=f"oxapay_check_{oxapay_track_id or track_id}")],
-            [InlineKeyboardButton(text="◀️ Cancel", callback_data="back_main")],
+            [apply_button_style(InlineKeyboardButton(text="💳 Pay Now", url=pay_link), 'success')],
+            [apply_button_style(InlineKeyboardButton(text="🔄 Check Status", callback_data=f"oxapay_check_{oxapay_track_id or track_id}"), 'primary')],
+            [apply_button_style(InlineKeyboardButton(text="◀️ Cancel", callback_data="back_main"), 'danger')],
         ]),
         parse_mode=ParseMode.HTML,
     )
@@ -1422,7 +1404,7 @@ async def cb_oxapay_check(query: CallbackQuery) -> None:
                         f"📝 <b>Order ID:</b> <code>{track_id}</code>\n\n"
                         f"Your balance has been updated!",
                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                            InlineKeyboardButton(text="◀️ Back to Menu", callback_data="back_main"),
+                            apply_button_style(InlineKeyboardButton(text="◀️ Back to Menu", callback_data="back_main"), 'danger'),
                         ]]),
                         parse_mode=ParseMode.HTML,
                     )
@@ -1518,10 +1500,10 @@ async def cmd_buy(message: Message) -> None:
         "🛍️ <b>Buy Accounts</b>\n\n"
         "Select a category to browse:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📱 Telegram Accounts", callback_data="buy_cat_telegram")],
-            [InlineKeyboardButton(text="🔐 Telegram Sessions", callback_data=f"buy_cat_{CATEGORY_TELEGRAM_SESSIONS}")],
-            [InlineKeyboardButton(text="💬 WhatsApp SMS", callback_data=f"buy_cat_{CATEGORY_WHATSAPP_SMS}")],
-            [InlineKeyboardButton(text="🔴 Back", callback_data="back_main")],
+            [apply_button_style(InlineKeyboardButton(text="📱 Telegram Accounts", callback_data="buy_cat_telegram"), 'primary')],
+            [apply_button_style(InlineKeyboardButton(text="🔐 Telegram Sessions", callback_data=f"buy_cat_{CATEGORY_TELEGRAM_SESSIONS}"), 'primary')],
+            [apply_button_style(InlineKeyboardButton(text="💬 WhatsApp SMS", callback_data=f"buy_cat_{CATEGORY_WHATSAPP_SMS}"), 'primary')],
+            [apply_button_style(InlineKeyboardButton(text="🔴 Back", callback_data="back_main"), 'danger')],
         ]),
         parse_mode=ParseMode.HTML,
     )
@@ -1530,39 +1512,40 @@ async def cmd_buy(message: Message) -> None:
 @router.callback_query(F.data == "buy")
 async def cb_buy(query: CallbackQuery) -> None:
     """Show main buy menu with categories."""
+    await query.answer()
     await query.message.edit_text(
         "🛍️ <b>Buy Accounts</b>\n\n"
         "Select a category to browse:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📱 Telegram Accounts", callback_data="buy_cat_telegram")],
-            [InlineKeyboardButton(text="🔐 Telegram Sessions", callback_data=f"buy_cat_{CATEGORY_TELEGRAM_SESSIONS}")],
-            [InlineKeyboardButton(text="💬 WhatsApp SMS", callback_data=f"buy_cat_{CATEGORY_WHATSAPP_SMS}")],
-            [InlineKeyboardButton(text="🔴 Back", callback_data="back_main")],
+            [apply_button_style(InlineKeyboardButton(text="📱 Telegram Accounts", callback_data="buy_cat_telegram"), 'primary')],
+            [apply_button_style(InlineKeyboardButton(text="🔐 Telegram Sessions", callback_data=f"buy_cat_{CATEGORY_TELEGRAM_SESSIONS}"), 'primary')],
+            [apply_button_style(InlineKeyboardButton(text="💬 WhatsApp SMS", callback_data=f"buy_cat_{CATEGORY_WHATSAPP_SMS}"), 'primary')],
+            [apply_button_style(InlineKeyboardButton(text="🔴 Back", callback_data="back_main"), 'danger')],
         ]),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 @router.callback_query(F.data == "buy_cat_telegram")
 async def cb_buy_cat_telegram(query: CallbackQuery) -> None:
     """Show Telegram account subcategories."""
+    await query.answer()
     await query.message.edit_text(
         "📱 <b>Telegram Accounts</b>\n\n"
         "Choose account type:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📱 Telegram Accounts", callback_data=f"buy_cat_{CATEGORY_TELEGRAM_ACCOUNTS}")],
-            [InlineKeyboardButton(text="📱 Telegram Old Accounts", callback_data=f"buy_cat_{CATEGORY_TELEGRAM_OLD}")],
-            [InlineKeyboardButton(text="🔴 Back", callback_data="buy")],
+            [apply_button_style(InlineKeyboardButton(text="📱 Telegram Accounts", callback_data=f"buy_cat_{CATEGORY_TELEGRAM_ACCOUNTS}"), 'primary')],
+            [apply_button_style(InlineKeyboardButton(text="📱 Telegram Old Accounts", callback_data=f"buy_cat_{CATEGORY_TELEGRAM_OLD}"), 'primary')],
+            [apply_button_style(InlineKeyboardButton(text="🔴 Back", callback_data="buy"), 'danger')],
         ]),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 @router.callback_query(F.data.startswith("buy_cat_"))
 async def cb_buy_category(query: CallbackQuery) -> None:
     """Show countries for selected category."""
+    await query.answer()
     category = query.data.replace("buy_cat_", "")
     
     if category == "telegram":
@@ -1570,12 +1553,12 @@ async def cb_buy_category(query: CallbackQuery) -> None:
         return
     
     await _show_category_countries(query.message, category, page=0, edit=True)
-    await query.answer()
 
 
 @router.callback_query(F.data.startswith("cat_countries_"))
 async def cb_cat_countries_page(query: CallbackQuery) -> None:
     """Handle pagination for category countries."""
+    await query.answer()
     # Format: cat_countries_{category}_{page}
     parts = query.data.replace("cat_countries_", "").rsplit("_", 1)
     if len(parts) != 2:
@@ -1589,7 +1572,6 @@ async def cb_cat_countries_page(query: CallbackQuery) -> None:
         page = 0
     
     await _show_category_countries(query.message, category, page=page, edit=True)
-    await query.answer()
 
 
 async def _show_category_countries(
@@ -1612,7 +1594,7 @@ async def _show_category_countries(
     if not countries_data:
         text = f"😔 No {category_name} available right now.\n\nCheck back later!"
         kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="◀️ Back", callback_data="buy"),
+            apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="buy"), 'danger'),
         ]])
         if edit:
             await message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
@@ -1624,30 +1606,30 @@ async def _show_category_countries(
     page_data = countries_data[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
 
     buttons = [
-        [InlineKeyboardButton(
+        [apply_button_style(InlineKeyboardButton(
             text=f"{get_country_flag(country)} {country.title()} ({count})",
             callback_data=f"cat_country_{category}_{country}",
-        )]
+        ), 'primary')]
         for country, count in page_data
     ]
     
     nav_row: list[InlineKeyboardButton] = []
     if page > 0:
         nav_row.append(
-            InlineKeyboardButton(text="⬅️ Prev", callback_data=f"cat_countries_{category}_{page - 1}")
+            apply_button_style(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"cat_countries_{category}_{page - 1}"), 'primary')
         )
     if page < total_pages - 1:
         nav_row.append(
-            InlineKeyboardButton(text="Next ➡️", callback_data=f"cat_countries_{category}_{page + 1}")
+            apply_button_style(InlineKeyboardButton(text="Next ➡️", callback_data=f"cat_countries_{category}_{page + 1}"), 'primary')
         )
     if nav_row:
         buttons.append(nav_row)
     
     # Back button based on category
     if category in [CATEGORY_TELEGRAM_ACCOUNTS, CATEGORY_TELEGRAM_OLD]:
-        buttons.append([InlineKeyboardButton(text="🔴 Back", callback_data="buy_cat_telegram")])
+        buttons.append([apply_button_style(InlineKeyboardButton(text="🔴 Back", callback_data="buy_cat_telegram"), 'danger')])
     else:
-        buttons.append([InlineKeyboardButton(text="🔴 Back", callback_data="buy")])
+        buttons.append([apply_button_style(InlineKeyboardButton(text="🔴 Back", callback_data="buy"), 'danger')])
 
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     text = (
@@ -1690,6 +1672,7 @@ async def cb_cat_country(query: CallbackQuery) -> None:
         await query.answer("❌ No numbers available for this country.", show_alert=True)
         return
     
+    await query.answer()
     available_count = len(products)
     price = products[0].price  # All should have same price per country
     
@@ -1702,17 +1685,17 @@ async def cb_cat_country(query: CallbackQuery) -> None:
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Click <b>Buy Now</b> to purchase a random number from this pool.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Buy Now", callback_data=f"buy_now_{category}_{country}")],
-            [InlineKeyboardButton(text="🔴 Cancel", callback_data=f"buy_cat_{category}")],
+            [apply_button_style(InlineKeyboardButton(text="✅ Buy Now", callback_data=f"buy_now_{category}_{country}"), 'success')],
+            [apply_button_style(InlineKeyboardButton(text="🔴 Cancel", callback_data=f"buy_cat_{category}"), 'danger')],
         ]),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 @router.callback_query(F.data.startswith("buy_now_"))
 async def cb_buy_now(query: CallbackQuery) -> None:
     """Process purchase - randomly assign a number from the pool."""
+    await query.answer()
     # Format: buy_now_{category}_{country}
     parts = query.data.replace("buy_now_", "").split("_", 1)
     if len(parts) != 2:
@@ -1759,12 +1742,11 @@ async def cb_buy_now(query: CallbackQuery) -> None:
                 f"💵 Required: <b>${product.price:.2f}</b>\n\n"
                 f"Please deposit funds first.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="📥 Deposit", callback_data="deposit")],
-                    [InlineKeyboardButton(text="◀️ Back", callback_data=f"cat_country_{category}_{country}")],
+                    [apply_button_style(InlineKeyboardButton(text="📥 Deposit", callback_data="deposit"), 'success')],
+                    [apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data=f"cat_country_{category}_{country}"), 'danger')],
                 ]),
                 parse_mode=ParseMode.HTML,
             )
-            await query.answer()
             return
         
         # Process purchase
@@ -1828,20 +1810,19 @@ async def cb_buy_now(query: CallbackQuery) -> None:
         f"4️⃣ Come back here and press <b>🔄 Get OTP</b>\n\n"
         f"⚡ OTP is fetched <b>instantly</b> from the account!",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Get OTP", callback_data=f"getotp_{pid}")],
-            [InlineKeyboardButton(text="◀️ Main Menu", callback_data="back_main")],
+            [apply_button_style(InlineKeyboardButton(text="🔄 Get OTP", callback_data=f"getotp_{pid}"), 'primary')],
+            [apply_button_style(InlineKeyboardButton(text="◀️ Main Menu", callback_data="back_main"), 'danger')],
         ]),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 # Legacy buy flow compatibility (for direct country selection without category)
 @router.callback_query(F.data.startswith("countries_page_"))
 async def cb_countries_page(query: CallbackQuery) -> None:
     page = int(query.data.split("_")[-1])
-    await _show_countries(query.message, page=page, edit=True)
     await query.answer()
+    await _show_countries(query.message, page=page, edit=True)
 
 
 async def _show_countries(
@@ -1859,7 +1840,7 @@ async def _show_countries(
     if not countries:
         text = "😔 No accounts available right now. Check back later!"
         kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="◀️ Back", callback_data="back_main"),
+            apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="back_main"), 'danger'),
         ]])
         if edit:
             await message.edit_text(text, reply_markup=kb)
@@ -1871,24 +1852,24 @@ async def _show_countries(
     page_countries = countries[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
 
     buttons = [
-        [InlineKeyboardButton(
+        [apply_button_style(InlineKeyboardButton(
             text=f"{get_country_flag(c)} {c}",
             callback_data=f"country_{c}",
-        )]
+        ), 'primary')]
         for c in page_countries
     ]
     nav_row: list[InlineKeyboardButton] = []
     if page > 0:
         nav_row.append(
-            InlineKeyboardButton(text="⬅️ Prev", callback_data=f"countries_page_{page - 1}")
+            apply_button_style(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"countries_page_{page - 1}"), 'primary')
         )
     if page < total_pages - 1:
         nav_row.append(
-            InlineKeyboardButton(text="Next ➡️", callback_data=f"countries_page_{page + 1}")
+            apply_button_style(InlineKeyboardButton(text="Next ➡️", callback_data=f"countries_page_{page + 1}"), 'primary')
         )
     if nav_row:
         buttons.append(nav_row)
-    buttons.append([InlineKeyboardButton(text="◀️ Back", callback_data="back_main")])
+    buttons.append([apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="back_main"), 'danger')])
 
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     text = f"🌍 Select a country (Page {page + 1}/{total_pages}):"
@@ -1900,6 +1881,7 @@ async def _show_countries(
 
 @router.callback_query(F.data.startswith("country_"))
 async def cb_country(query: CallbackQuery) -> None:
+    await query.answer()
     country = query.data[len("country_"):]
     async with AsyncSessionFactory() as session:
         rows = await session.execute(
@@ -1914,23 +1896,23 @@ async def cb_country(query: CallbackQuery) -> None:
         return
 
     buttons = [
-        [InlineKeyboardButton(
+        [apply_button_style(InlineKeyboardButton(
             text=f"📱 {p.phone_number}  –  ${p.price:.2f}",
             callback_data=f"product_{p.id}",
-        )]
+        ), 'primary')]
         for p in products
     ]
-    buttons.append([InlineKeyboardButton(text="◀️ Back", callback_data="buy")])
+    buttons.append([apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="buy"), 'danger')])
     await query.message.edit_text(
         f"📋 Available numbers in <b>{get_country_flag(country)} {country}</b>:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 @router.callback_query(F.data.startswith("product_"))
 async def cb_product(query: CallbackQuery) -> None:
+    await query.answer()
     product_id = int(query.data.split("_")[1])
     async with AsyncSessionFactory() as session:
         result = await session.execute(select(Product).where(Product.id == product_id))
@@ -1945,16 +1927,16 @@ async def cb_product(query: CallbackQuery) -> None:
         f"💵 Price: <b>${p.price:.2f} USDT</b>\n\n"
         f"Tap <b>Buy Now</b> to purchase.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Buy Now", callback_data=f"buynow_{product_id}")],
-            [InlineKeyboardButton(text="◀️ Back",    callback_data=f"country_{p.country}")],
+            [apply_button_style(InlineKeyboardButton(text="✅ Buy Now", callback_data=f"buynow_{product_id}"), 'success')],
+            [apply_button_style(InlineKeyboardButton(text="◀️ Back",    callback_data=f"country_{p.country}"), 'danger')],
         ]),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 @router.callback_query(F.data.startswith("buynow_"))
 async def cb_buynow(query: CallbackQuery) -> None:
+    await query.answer()
     product_id = int(query.data.split("_")[1])
     user_id = query.from_user.id
 
@@ -1978,12 +1960,11 @@ async def cb_buynow(query: CallbackQuery) -> None:
                 f"Required: <b>${p.price:.2f}</b>\n\n"
                 f"Please deposit funds first.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🟢 Deposit", callback_data="deposit")],
-                    [InlineKeyboardButton(text="◀️ Back",    callback_data=f"product_{product_id}")],
+                    [apply_button_style(InlineKeyboardButton(text="🟢 Deposit", callback_data="deposit"), 'success')],
+                    [apply_button_style(InlineKeyboardButton(text="◀️ Back",    callback_data=f"product_{product_id}"), 'danger')],
                 ]),
                 parse_mode=ParseMode.HTML,
             )
-            await query.answer()
             return
 
         new_balance = Decimal(str(user.balance)) - Decimal(str(p.price))
@@ -2034,12 +2015,11 @@ async def cb_buynow(query: CallbackQuery) -> None:
         f"4️⃣ Come back here and press <b>🔄 Get OTP</b>\n\n"
         f"⚡ OTP is fetched <b>instantly</b> from the account!",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Get OTP", callback_data=f"getotp_{pid}")],
-            [InlineKeyboardButton(text="◀️ Main Menu", callback_data="back_main")],
+            [apply_button_style(InlineKeyboardButton(text="🔄 Get OTP", callback_data=f"getotp_{pid}"), 'primary')],
+            [apply_button_style(InlineKeyboardButton(text="◀️ Main Menu", callback_data="back_main"), 'danger')],
         ]),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 # ── Get OTP (redesigned) ─────────────────────────────────────────────────────
@@ -2064,7 +2044,7 @@ async def cb_getotp(query: CallbackQuery) -> None:
             query.message,
             "❌ <b>Product not found.</b>\n\nPlease contact support.",
             InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="◀️ Main Menu", callback_data="back_main"),
+                apply_button_style(InlineKeyboardButton(text="◀️ Main Menu", callback_data="back_main"), 'danger'),
             ]]),
         )
         return
@@ -2076,7 +2056,7 @@ async def cb_getotp(query: CallbackQuery) -> None:
             "No session string is configured for this number. "
             "Please contact support.",
             InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="◀️ Main Menu", callback_data="back_main"),
+                apply_button_style(InlineKeyboardButton(text="◀️ Main Menu", callback_data="back_main"), 'danger'),
             ]]),
         )
         return
@@ -2092,7 +2072,7 @@ async def cb_getotp(query: CallbackQuery) -> None:
             f"📱 Enter this code in Telegram to complete login.\n"
             f"⚠️ Do <b>not</b> share this code with anyone.",
             InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="◀️ Main Menu", callback_data="back_main")],
+                [apply_button_style(InlineKeyboardButton(text="◀️ Main Menu", callback_data="back_main"), 'danger')],
             ]),
         )
     else:
@@ -2105,10 +2085,10 @@ async def cb_getotp(query: CallbackQuery) -> None:
             f"for number <b>{p.phone_number}</b>, then tap Refresh.\n\n"
             f"🕐 <i>Last checked: {checked_at}</i>",
             InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(
+                [apply_button_style(InlineKeyboardButton(
                     text="🔄 Refresh", callback_data=f"getotp_{product_id}"
-                )],
-                [InlineKeyboardButton(text="◀️ Main Menu", callback_data="back_main")],
+                ), 'primary')],
+                [apply_button_style(InlineKeyboardButton(text="◀️ Main Menu", callback_data="back_main"), 'danger')],
             ]),
         )
 
@@ -2128,6 +2108,7 @@ async def _safe_edit(
 
 @router.callback_query(F.data == "back_main")
 async def cb_back_main(query: CallbackQuery) -> None:
+    await query.answer()
     async with AsyncSessionFactory() as session:
         user = await get_or_create_user(
             session,
@@ -2147,13 +2128,13 @@ async def cb_back_main(query: CallbackQuery) -> None:
         await query.message.answer(welcome_text, reply_markup=kb, parse_mode=ParseMode.HTML)
     else:
         await query.message.edit_text(welcome_text, reply_markup=kb, parse_mode=ParseMode.HTML)
-    await query.answer()
 
 
 # ── Referral ──────────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data == "referral")
 async def cb_referral(query: CallbackQuery) -> None:
+    await query.answer()
     user_id = query.from_user.id
     async with AsyncSessionFactory() as session:
         result = await session.execute(select(User).where(User.referred_by == user_id))
@@ -2178,11 +2159,10 @@ async def cb_referral(query: CallbackQuery) -> None:
         f"Earn <b>{REFERRAL_COMMISSION_PCT}%</b> commission on every deposit "
         f"made by your referrals!",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="◀️ Back", callback_data="back_main"),
+            apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="back_main"), 'danger'),
         ]]),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2209,15 +2189,15 @@ def admin_only(func):
 
 def build_admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Add Number",     callback_data="admin_add_number")],
-        [InlineKeyboardButton(text="📦 View Inventory", callback_data="admin_inventory_0")],
-        [InlineKeyboardButton(text="📋 Pending Orders", callback_data="admin_orders")],
+        [apply_button_style(InlineKeyboardButton(text="➕ Add Number",     callback_data="admin_add_number"), 'primary')],
+        [apply_button_style(InlineKeyboardButton(text="📦 View Inventory", callback_data="admin_inventory_0"), 'primary')],
+        [apply_button_style(InlineKeyboardButton(text="📋 Pending Orders", callback_data="admin_orders"), 'primary')],
         [
-            InlineKeyboardButton(text="👥 Users",        callback_data="admin_users_0"),
-            InlineKeyboardButton(text="🔍 Search User",  callback_data="admin_search_user"),
+            apply_button_style(InlineKeyboardButton(text="👥 Users",        callback_data="admin_users_0"), 'primary'),
+            apply_button_style(InlineKeyboardButton(text="🔍 Search User",  callback_data="admin_search_user"), 'primary'),
         ],
-        [InlineKeyboardButton(text="📢 Broadcast",      callback_data="admin_broadcast")],
-        [InlineKeyboardButton(text="◀️ Main Menu",      callback_data="back_main")],
+        [apply_button_style(InlineKeyboardButton(text="📢 Broadcast",      callback_data="admin_broadcast"), 'primary')],
+        [apply_button_style(InlineKeyboardButton(text="◀️ Main Menu",      callback_data="back_main"), 'danger')],
     ])
 
 
@@ -2234,12 +2214,12 @@ async def cmd_admin(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "admin_menu")
 @admin_only
 async def cb_admin_menu(query: CallbackQuery, state: FSMContext) -> None:
+    await query.answer()
     await state.clear()
     await query.message.edit_text(
         "🔐 <b>Admin Panel</b>", reply_markup=build_admin_keyboard(),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 # ── Add Number FSM ────────────────────────────────────────────────────────────
@@ -2248,25 +2228,26 @@ async def cb_admin_menu(query: CallbackQuery, state: FSMContext) -> None:
 @admin_only
 async def cb_admin_add_number(query: CallbackQuery, state: FSMContext) -> None:
     """Start add number flow - first select category."""
+    await query.answer()
     await query.message.edit_text(
         "➕ <b>Add New Number</b>\n\n"
         "Step 1/5: Select the <b>category</b>:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📱 Telegram Accounts", callback_data=f"admin_add_cat_{CATEGORY_TELEGRAM_ACCOUNTS}")],
-            [InlineKeyboardButton(text="📱 Telegram Old Accounts", callback_data=f"admin_add_cat_{CATEGORY_TELEGRAM_OLD}")],
-            [InlineKeyboardButton(text="🔐 Telegram Sessions", callback_data=f"admin_add_cat_{CATEGORY_TELEGRAM_SESSIONS}")],
-            [InlineKeyboardButton(text="💬 WhatsApp SMS", callback_data=f"admin_add_cat_{CATEGORY_WHATSAPP_SMS}")],
-            [InlineKeyboardButton(text="❌ Cancel", callback_data="admin_menu")],
+            [apply_button_style(InlineKeyboardButton(text="📱 Telegram Accounts", callback_data=f"admin_add_cat_{CATEGORY_TELEGRAM_ACCOUNTS}"), 'primary')],
+            [apply_button_style(InlineKeyboardButton(text="📱 Telegram Old Accounts", callback_data=f"admin_add_cat_{CATEGORY_TELEGRAM_OLD}"), 'primary')],
+            [apply_button_style(InlineKeyboardButton(text="🔐 Telegram Sessions", callback_data=f"admin_add_cat_{CATEGORY_TELEGRAM_SESSIONS}"), 'primary')],
+            [apply_button_style(InlineKeyboardButton(text="💬 WhatsApp SMS", callback_data=f"admin_add_cat_{CATEGORY_WHATSAPP_SMS}"), 'primary')],
+            [apply_button_style(InlineKeyboardButton(text="❌ Cancel", callback_data="admin_menu"), 'danger')],
         ]),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 @router.callback_query(F.data.startswith("admin_add_cat_"))
 @admin_only
 async def cb_admin_add_category(query: CallbackQuery, state: FSMContext) -> None:
     """Category selected, now ask for country."""
+    await query.answer()
     category = query.data.replace("admin_add_cat_", "")
     category_name = PRODUCT_CATEGORIES.get(category, "Unknown")
     
@@ -2278,11 +2259,10 @@ async def cb_admin_add_category(query: CallbackQuery, state: FSMContext) -> None
         f"📁 Category: <b>{category_name}</b>\n\n"
         f"Step 2/5: Enter the <b>country name</b>:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="❌ Cancel", callback_data="admin_cancel_add"),
+            apply_button_style(InlineKeyboardButton(text="❌ Cancel", callback_data="admin_cancel_add"), 'danger'),
         ]]),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 @router.message(AdminAddNumber.country)
@@ -2293,7 +2273,7 @@ async def fsm_add_country(message: Message, state: FSMContext) -> None:
     await message.answer(
         "Step 3/5: Enter the <b>phone number</b> (e.g. +91 9876543210):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="❌ Cancel", callback_data="admin_cancel_add"),
+            apply_button_style(InlineKeyboardButton(text="❌ Cancel", callback_data="admin_cancel_add"), 'danger'),
         ]]),
         parse_mode=ParseMode.HTML,
     )
@@ -2307,7 +2287,7 @@ async def fsm_add_phone(message: Message, state: FSMContext) -> None:
     await message.answer(
         "Step 4/5: Enter the <b>price in USDT</b> (e.g. 5.00):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="❌ Cancel", callback_data="admin_cancel_add"),
+            apply_button_style(InlineKeyboardButton(text="❌ Cancel", callback_data="admin_cancel_add"), 'danger'),
         ]]),
         parse_mode=ParseMode.HTML,
     )
@@ -2329,7 +2309,7 @@ async def fsm_add_price(message: Message, state: FSMContext) -> None:
         "Step 5/5: Paste the <b>Pyrogram Session String</b> for this number\n"
         "(generate it with <code>generate_session.py</code>):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="❌ Cancel", callback_data="admin_cancel_add"),
+            apply_button_style(InlineKeyboardButton(text="❌ Cancel", callback_data="admin_cancel_add"), 'danger'),
         ]]),
         parse_mode=ParseMode.HTML,
     )
@@ -2371,6 +2351,7 @@ async def fsm_add_session_string(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "admin_cancel_add")
 @admin_only
 async def cb_admin_cancel_add(query: CallbackQuery, state: FSMContext) -> None:
+    await query.answer()
     await state.clear()
     try:
         await query.message.edit_text(
@@ -2384,7 +2365,6 @@ async def cb_admin_cancel_add(query: CallbackQuery, state: FSMContext) -> None:
             reply_markup=build_admin_keyboard(),
             parse_mode=ParseMode.HTML,
         )
-    await query.answer()
 
 
 # ── View / Remove Inventory ───────────────────────────────────────────────────
@@ -2392,6 +2372,7 @@ async def cb_admin_cancel_add(query: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data.startswith("admin_inventory_"))
 @admin_only
 async def cb_admin_inventory(query: CallbackQuery) -> None:
+    await query.answer()
     page = int(query.data.split("_")[-1])
     async with AsyncSessionFactory() as session:
         rows = await session.execute(
@@ -2404,43 +2385,42 @@ async def cb_admin_inventory(query: CallbackQuery) -> None:
             "📦 Inventory is empty.",
             reply_markup=build_admin_keyboard(),
         )
-        await query.answer()
         return
 
     total_pages = (len(products) + PAGE_SIZE - 1) // PAGE_SIZE
     page_products = products[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
 
     buttons = [
-        [InlineKeyboardButton(
+        [apply_button_style(InlineKeyboardButton(
             text=f"[{p.status}] {p.phone_number} ({p.country}) ${p.price:.2f}",
             callback_data=f"admin_inv_item_{p.id}",
-        )]
+        ), 'primary')]
         for p in page_products
     ]
     nav_row: list[InlineKeyboardButton] = []
     if page > 0:
         nav_row.append(
-            InlineKeyboardButton(text="⬅️ Prev", callback_data=f"admin_inventory_{page - 1}")
+            apply_button_style(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"admin_inventory_{page - 1}"), 'primary')
         )
     if page < total_pages - 1:
         nav_row.append(
-            InlineKeyboardButton(text="Next ➡️", callback_data=f"admin_inventory_{page + 1}")
+            apply_button_style(InlineKeyboardButton(text="Next ➡️", callback_data=f"admin_inventory_{page + 1}"), 'primary')
         )
     if nav_row:
         buttons.append(nav_row)
-    buttons.append([InlineKeyboardButton(text="◀️ Back", callback_data="admin_menu")])
+    buttons.append([apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="admin_menu"), 'danger')])
 
     await query.message.edit_text(
         f"📦 <b>Inventory</b> (Page {page + 1}/{total_pages}):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 @router.callback_query(F.data.startswith("admin_inv_item_"))
 @admin_only
 async def cb_admin_inv_item(query: CallbackQuery) -> None:
+    await query.answer()
     product_id = int(query.data.split("_")[-1])
     async with AsyncSessionFactory() as session:
         result = await session.execute(select(Product).where(Product.id == product_id))
@@ -2455,20 +2435,20 @@ async def cb_admin_inv_item(query: CallbackQuery) -> None:
         f"Session: {'✅ Set' if p.session_string else '❌ Not set'}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(
+                apply_button_style(InlineKeyboardButton(
                     text="🗑 Remove/Mark Sold", callback_data=f"admin_remove_{p.id}"
-                ),
+                ), 'danger'),
             ],
-            [InlineKeyboardButton(text="◀️ Back", callback_data="admin_inventory_0")],
+            [apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="admin_inventory_0"), 'danger')],
         ]),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 @router.callback_query(F.data.startswith("admin_remove_"))
 @admin_only
 async def cb_admin_remove(query: CallbackQuery) -> None:
+    await query.answer()
     product_id = int(query.data.split("_")[-1])
     async with AsyncSessionFactory() as session:
         await session.execute(
@@ -2479,7 +2459,6 @@ async def cb_admin_remove(query: CallbackQuery) -> None:
         "✅ Number marked as Sold / removed from storefront.",
         reply_markup=build_admin_keyboard(),
     )
-    await query.answer()
 
 
 # ── Pending Orders ────────────────────────────────────────────────────────────
@@ -2487,6 +2466,7 @@ async def cb_admin_remove(query: CallbackQuery) -> None:
 @router.callback_query(F.data == "admin_orders")
 @admin_only
 async def cb_admin_orders(query: CallbackQuery) -> None:
+    await query.answer()
     async with AsyncSessionFactory() as session:
         rows = await session.execute(
             select(Order).where(Order.status == "PendingAdmin").order_by(Order.id)
@@ -2498,28 +2478,27 @@ async def cb_admin_orders(query: CallbackQuery) -> None:
             "📋 No pending orders.",
             reply_markup=build_admin_keyboard(),
         )
-        await query.answer()
         return
 
     buttons = [
-        [InlineKeyboardButton(
+        [apply_button_style(InlineKeyboardButton(
             text=f"Order #{o.id} (User {o.user_id})",
             callback_data=f"admin_order_detail_{o.id}",
-        )]
+        ), 'primary')]
         for o in orders
     ]
-    buttons.append([InlineKeyboardButton(text="◀️ Back", callback_data="admin_menu")])
+    buttons.append([apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="admin_menu"), 'danger')])
     await query.message.edit_text(
         "📋 <b>Pending Orders:</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 @router.callback_query(F.data.startswith("admin_order_detail_"))
 @admin_only
 async def cb_admin_order_detail(query: CallbackQuery) -> None:
+    await query.answer()
     order_id = int(query.data.split("_")[-1])
     async with AsyncSessionFactory() as session:
         result_o = await session.execute(select(Order).where(Order.id == order_id))
@@ -2542,23 +2521,23 @@ async def cb_admin_order_detail(query: CallbackQuery) -> None:
         f"Status: {order.status}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(
+                apply_button_style(InlineKeyboardButton(
                     text="✅ Fulfill", callback_data=f"admin_fulfill_{order_id}"
-                ),
-                InlineKeyboardButton(
+                ), 'success'),
+                apply_button_style(InlineKeyboardButton(
                     text="❌ Refund", callback_data=f"admin_refund_{order_id}"
-                ),
+                ), 'danger'),
             ],
-            [InlineKeyboardButton(text="◀️ Back", callback_data="admin_orders")],
+            [apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="admin_orders"), 'danger')],
         ]),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 @router.callback_query(F.data.startswith("admin_fulfill_"))
 @admin_only
 async def cb_admin_fulfill(query: CallbackQuery, state: FSMContext) -> None:
+    await query.answer()
     order_id = int(query.data.split("_")[-1])
     await state.set_state(AdminFulfillOrder.account_details)
     await state.update_data(order_id=order_id)
@@ -2567,7 +2546,6 @@ async def cb_admin_fulfill(query: CallbackQuery, state: FSMContext) -> None:
         f"Please send the account credentials / OTP details to forward to the buyer:",
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 @router.message(AdminFulfillOrder.account_details)
@@ -2681,7 +2659,6 @@ async def cb_admin_refund(query: CallbackQuery) -> None:
         f"↩️ Order #{order_id} refunded successfully.",
         reply_markup=build_admin_keyboard(),
     )
-    await query.answer()
 
 
 # ── Broadcast ─────────────────────────────────────────────────────────────────
@@ -2689,12 +2666,12 @@ async def cb_admin_refund(query: CallbackQuery) -> None:
 @router.callback_query(F.data == "admin_broadcast")
 @admin_only
 async def cb_admin_broadcast(query: CallbackQuery, state: FSMContext) -> None:
+    await query.answer()
     await state.set_state(AdminBroadcast.message)
     await query.message.edit_text(
         "📢 <b>Broadcast Message</b>\n\nSend the message you want to broadcast to all users:",
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 @router.message(AdminBroadcast.message)
@@ -2924,9 +2901,9 @@ async def _show_admin_user_detail(message: Message, user_id: int) -> None:
         purchases = ord_rows.scalars().all()
 
     ban_btn = (
-        InlineKeyboardButton(text="✅ Unban", callback_data=f"admin_unban_{user_id}")
+        apply_button_style(InlineKeyboardButton(text="✅ Unban", callback_data=f"admin_unban_{user_id}"), 'success')
         if u.is_banned
-        else InlineKeyboardButton(text="🚫 Ban", callback_data=f"admin_ban_{user_id}")
+        else apply_button_style(InlineKeyboardButton(text="🚫 Ban", callback_data=f"admin_ban_{user_id}"), 'danger')
     )
     joined = u.created_at.strftime("%Y-%m-%d") if u.created_at else "N/A"
     await message.edit_text(
@@ -2942,16 +2919,16 @@ async def _show_admin_user_detail(message: Message, user_id: int) -> None:
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [ban_btn],
             [
-                InlineKeyboardButton(
+                apply_button_style(InlineKeyboardButton(
                     text="💰 Deposits",
                     callback_data=f"admin_user_deposits_{user_id}",
-                ),
-                InlineKeyboardButton(
+                ), 'primary'),
+                apply_button_style(InlineKeyboardButton(
                     text="📦 Purchases",
                     callback_data=f"admin_user_purchases_{user_id}",
-                ),
+                ), 'primary'),
             ],
-            [InlineKeyboardButton(text="◀️ Back to Users", callback_data="admin_users_0")],
+            [apply_button_style(InlineKeyboardButton(text="◀️ Back to Users", callback_data="admin_users_0"), 'danger')],
         ]),
         parse_mode=ParseMode.HTML,
     )
@@ -2960,6 +2937,7 @@ async def _show_admin_user_detail(message: Message, user_id: int) -> None:
 @router.callback_query(F.data.startswith("admin_users_"))
 @admin_only
 async def cb_admin_users(query: CallbackQuery) -> None:
+    await query.answer()
     page = int(query.data.split("_")[-1])
     async with AsyncSessionFactory() as session:
         rows = await session.execute(select(User).order_by(User.id))
@@ -2967,50 +2945,48 @@ async def cb_admin_users(query: CallbackQuery) -> None:
 
     if not users:
         await query.message.edit_text("👥 No users found.", reply_markup=build_admin_keyboard())
-        await query.answer()
         return
 
     total_pages = (len(users) + PAGE_SIZE - 1) // PAGE_SIZE
     page_users = users[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
 
     buttons = [
-        [InlineKeyboardButton(
+        [apply_button_style(InlineKeyboardButton(
             text=(
                 f"{'🚫 ' if u.is_banned else ''}"
                 f"{('@' + u.username) if u.username else str(u.id)}"
                 f" (ID: {u.id})"
             ),
             callback_data=f"admin_user_detail_{u.id}",
-        )]
+        ), 'primary')]
         for u in page_users
     ]
     nav_row: list[InlineKeyboardButton] = []
     if page > 0:
         nav_row.append(
-            InlineKeyboardButton(text="⬅️ Prev", callback_data=f"admin_users_{page - 1}")
+            apply_button_style(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"admin_users_{page - 1}"), 'primary')
         )
     if page < total_pages - 1:
         nav_row.append(
-            InlineKeyboardButton(text="Next ➡️", callback_data=f"admin_users_{page + 1}")
+            apply_button_style(InlineKeyboardButton(text="Next ➡️", callback_data=f"admin_users_{page + 1}"), 'primary')
         )
     if nav_row:
         buttons.append(nav_row)
-    buttons.append([InlineKeyboardButton(text="◀️ Back", callback_data="admin_menu")])
+    buttons.append([apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="admin_menu"), 'danger')])
 
     await query.message.edit_text(
         f"👥 <b>Users</b> (Page {page + 1}/{total_pages}, Total: {len(users)}):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 @router.callback_query(F.data.startswith("admin_user_detail_"))
 @admin_only
 async def cb_admin_user_detail(query: CallbackQuery) -> None:
+    await query.answer()
     user_id = int(query.data.split("_")[-1])
     await _show_admin_user_detail(query.message, user_id)
-    await query.answer()
 
 
 @router.callback_query(F.data.startswith("admin_ban_"))
@@ -3055,6 +3031,7 @@ async def cb_admin_user_deposits(query: CallbackQuery) -> None:
         await query.answer("No deposits found for this user.", show_alert=True)
         return
 
+    await query.answer()
     lines = [f"💰 <b>Deposits for User {user_id}</b>\n"]
     total = Decimal("0")
     for d in deposits[:MAX_DISPLAY_ITEMS]:
@@ -3068,13 +3045,12 @@ async def cb_admin_user_deposits(query: CallbackQuery) -> None:
     await query.message.edit_text(
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
+            apply_button_style(InlineKeyboardButton(
                 text="◀️ Back", callback_data=f"admin_user_detail_{user_id}",
-            ),
+            ), 'danger'),
         ]]),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 @router.callback_query(F.data.startswith("admin_user_purchases_"))
@@ -3101,6 +3077,7 @@ async def cb_admin_user_purchases(query: CallbackQuery) -> None:
         await query.answer("No purchases found for this user.", show_alert=True)
         return
 
+    await query.answer()
     lines = [f"📦 <b>Purchases for User {user_id}</b>\n"]
     for o in orders[:MAX_DISPLAY_ITEMS]:
         p = products.get(o.product_id)
@@ -3117,13 +3094,12 @@ async def cb_admin_user_purchases(query: CallbackQuery) -> None:
     await query.message.edit_text(
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
+            apply_button_style(InlineKeyboardButton(
                 text="◀️ Back", callback_data=f"admin_user_detail_{user_id}",
-            ),
+            ), 'danger'),
         ]]),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 # ── Admin: Search User ────────────────────────────────────────────────────────
@@ -3131,27 +3107,27 @@ async def cb_admin_user_purchases(query: CallbackQuery) -> None:
 @router.callback_query(F.data == "admin_search_user")
 @admin_only
 async def cb_admin_search_user(query: CallbackQuery, state: FSMContext) -> None:
+    await query.answer()
     await state.set_state(AdminSearchUser.user_input)
     await query.message.edit_text(
         "🔍 <b>Search User</b>\n\nEnter a <b>Telegram ID</b> or <b>@username</b>:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="❌ Cancel", callback_data="admin_cancel_search"),
+            apply_button_style(InlineKeyboardButton(text="❌ Cancel", callback_data="admin_cancel_search"), 'danger'),
         ]]),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 @router.callback_query(F.data == "admin_cancel_search")
 @admin_only
 async def cb_admin_cancel_search(query: CallbackQuery, state: FSMContext) -> None:
+    await query.answer()
     await state.clear()
     await query.message.edit_text(
         "🔐 <b>Admin Panel</b>",
         reply_markup=build_admin_keyboard(),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 @router.message(AdminSearchUser.user_input)
@@ -3192,9 +3168,9 @@ async def fsm_search_user(message: Message, state: FSMContext) -> None:
         purchases = ord_rows.scalars().all()
 
     ban_btn = (
-        InlineKeyboardButton(text="✅ Unban", callback_data=f"admin_unban_{u.id}")
+        apply_button_style(InlineKeyboardButton(text="✅ Unban", callback_data=f"admin_unban_{u.id}"), 'success')
         if u.is_banned
-        else InlineKeyboardButton(text="🚫 Ban", callback_data=f"admin_ban_{u.id}")
+        else apply_button_style(InlineKeyboardButton(text="🚫 Ban", callback_data=f"admin_ban_{u.id}"), 'danger')
     )
     joined = u.created_at.strftime("%Y-%m-%d") if u.created_at else "N/A"
     await message.answer(
@@ -3210,16 +3186,16 @@ async def fsm_search_user(message: Message, state: FSMContext) -> None:
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [ban_btn],
             [
-                InlineKeyboardButton(
+                apply_button_style(InlineKeyboardButton(
                     text="💰 Deposits",
                     callback_data=f"admin_user_deposits_{u.id}",
-                ),
-                InlineKeyboardButton(
+                ), 'primary'),
+                apply_button_style(InlineKeyboardButton(
                     text="📦 Purchases",
                     callback_data=f"admin_user_purchases_{u.id}",
-                ),
+                ), 'primary'),
             ],
-            [InlineKeyboardButton(text="◀️ Back to Admin", callback_data="admin_menu")],
+            [apply_button_style(InlineKeyboardButton(text="◀️ Back to Admin", callback_data="admin_menu"), 'danger')],
         ]),
         parse_mode=ParseMode.HTML,
     )
@@ -3229,6 +3205,7 @@ async def fsm_search_user(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "my_purchases")
 async def cb_my_purchases(query: CallbackQuery) -> None:
+    await query.answer()
     user_id = query.from_user.id
     async with AsyncSessionFactory() as session:
         ord_rows = await session.execute(
@@ -3250,10 +3227,9 @@ async def cb_my_purchases(query: CallbackQuery) -> None:
         await query.message.edit_text(
             "📦 You haven't purchased any numbers yet.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="◀️ Back", callback_data="back_main"),
+                apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="back_main"), 'danger'),
             ]]),
         )
-        await query.answer()
         return
 
     buttons = []
@@ -3261,18 +3237,17 @@ async def cb_my_purchases(query: CallbackQuery) -> None:
         p = products_map.get(o.product_id)
         phone = p.phone_number if p else f"Order #{o.id}"
         otp_icon = "✅" if (p and p.latest_otp) else "⏳"
-        buttons.append([InlineKeyboardButton(
+        buttons.append([apply_button_style(InlineKeyboardButton(
             text=f"{otp_icon} {phone}",
             callback_data=f"purchase_detail_{o.id}",
-        )])
-    buttons.append([InlineKeyboardButton(text="◀️ Back", callback_data="back_main")])
+        ), 'primary')])
+    buttons.append([apply_button_style(InlineKeyboardButton(text="◀️ Back", callback_data="back_main"), 'danger')])
 
     await query.message.edit_text(
         "📦 <b>My Purchases</b>\n\n✅ = OTP received  ⏳ = Waiting for OTP",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 @router.callback_query(F.data.startswith("purchase_detail_"))
@@ -3294,27 +3269,27 @@ async def cb_purchase_detail(query: CallbackQuery) -> None:
         )
         p = result_p.scalar_one_or_none()
 
+    await query.answer()
     if p is None:
         await query.message.edit_text(
             "❌ Product details not found.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="◀️ My Purchases", callback_data="my_purchases"),
+                apply_button_style(InlineKeyboardButton(text="◀️ My Purchases", callback_data="my_purchases"), 'danger'),
             ]]),
         )
-        await query.answer()
         return
 
     dt = o.created_at.strftime("%Y-%m-%d %H:%M") if o.created_at else "N/A"
     if p.latest_otp:
         otp_line = f"✅ <b>OTP Received:</b> <code>{p.latest_otp}</code>"
         kb_rows = [
-            [InlineKeyboardButton(text="◀️ My Purchases", callback_data="my_purchases")],
+            [apply_button_style(InlineKeyboardButton(text="◀️ My Purchases", callback_data="my_purchases"), 'danger')],
         ]
     else:
         otp_line = "⏳ OTP not received yet."
         kb_rows = [
-            [InlineKeyboardButton(text="🔄 Get OTP", callback_data=f"getotp_{p.id}")],
-            [InlineKeyboardButton(text="◀️ My Purchases", callback_data="my_purchases")],
+            [apply_button_style(InlineKeyboardButton(text="🔄 Get OTP", callback_data=f"getotp_{p.id}"), 'primary')],
+            [apply_button_style(InlineKeyboardButton(text="◀️ My Purchases", callback_data="my_purchases"), 'danger')],
         ]
 
     await query.message.edit_text(
@@ -3326,7 +3301,6 @@ async def cb_purchase_detail(query: CallbackQuery) -> None:
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
         parse_mode=ParseMode.HTML,
     )
-    await query.answer()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
