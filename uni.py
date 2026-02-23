@@ -390,6 +390,8 @@ def format_session_full(session_string: Optional[str]) -> str:
 
 
 
+def get_country_flag(country: str) -> str:
+    """Return the flag emoji for a given country name."""
     return COUNTRY_FLAGS.get(country.lower().strip(), "🌍")
 
 
