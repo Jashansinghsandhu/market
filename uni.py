@@ -33,6 +33,12 @@ DATA PERSISTENCE:
 # ─────────────────────────────────────────────────────────────────────────────
 #  CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
+# NOTE: For production use, move sensitive credentials to environment variables:
+#   BOT_TOKEN = os.getenv("BOT_TOKEN")
+#   OXAPAY_API_KEY = os.getenv("OXAPAY_API_KEY")
+#   MASTER_WALLET_PRIVATE_KEY = os.getenv("WALLET_PRIVATE_KEY")
+#   etc.
+# ─────────────────────────────────────────────────────────────────────────────
 
 BOT_TOKEN = "8320586826:AAGsP6LgRM0nKXw_eb9NU7cP0TMo7LSTBqc"
 
@@ -61,7 +67,7 @@ OXAPAY_POLL_INTERVAL = 30  # Check OxaPay payments every 30 seconds
 GAS_BNB_AMOUNT = 0.001
 BNB_CONFIRMATION_WAIT_SECONDS = 5
 REFERRAL_COMMISSION_PCT = 1.5
-SUPPORT_USERNAME = "jashanxjagy"
+SUPPORT_USERNAME = "jashanxjagy"  # Without @ prefix (added in URLs)
 DATABASE_URL = "sqlite+aiosqlite:///marketplace.db"
 BLOCKCHAIN_STATE_FILE = "blockchain_state.json"
 FERNET_KEY = "m8gzSFYcYk41uYxNUqCwpn-YGvo1_sVwDNTg-2FgBTg="
@@ -152,6 +158,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import signal
 import traceback
 import uuid
@@ -424,24 +431,27 @@ async def get_or_create_user(
 
 
 def build_main_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
-    """Build the main menu with colored inline buttons."""
-    # Note: color= parameter works with Telegram Bot API 7.3+ (Feb 2024)
+    """Build the main menu with styled inline buttons.
+    
+    Note: Telegram Bot API 7.3+ (Feb 2024) introduced button styling parameters.
+    Currently using emoji-based visual styling for compatibility.
+    """
     buttons = [
-        # Row 1: Buy Accounts (wider, blue)
+        # Row 1: Buy Accounts (wider)
         [
             InlineKeyboardButton(text="🛍️ Buy Accounts", callback_data="buy"),
         ],
-        # Row 2: Deposit (green) + Profile (blue)
+        # Row 2: Deposit + Profile
         [
             InlineKeyboardButton(text="📥 Deposit", callback_data="deposit"),
             InlineKeyboardButton(text="👤 Profile", callback_data="profile"),
         ],
-        # Row 3: Referral (green) + Help (blue)
+        # Row 3: Referral + Help
         [
             InlineKeyboardButton(text="🤝 Referral", callback_data="referral"),
             InlineKeyboardButton(text="❓ Help", callback_data="help"),
         ],
-        # Row 4: Support (red, redirect)
+        # Row 4: Support (redirect to telegram)
         [
             InlineKeyboardButton(
                 text="🆘 Support",
@@ -1738,8 +1748,8 @@ async def cb_buy_now(query: CallbackQuery) -> None:
             await query.answer("❌ No numbers available. Please try another country.", show_alert=True)
             return
         
-        # Randomly select one product
-        product = random.choice(available_products)
+        # Securely randomly select one product
+        product = secrets.choice(available_products)
         
         # Check balance
         if Decimal(str(user.balance)) < Decimal(str(product.price)):
